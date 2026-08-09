@@ -1,4 +1,4 @@
-# 🛰️ GeoIntel — Warship Detection & Tracking System
+# 🛰️ GeoVision — Warship Detection & Tracking System
 
 A production-grade satellite image processing pipeline for detecting and tracking
 major surface warships in near-real-time using Sentinel-1 SAR and Sentinel-2 optical
