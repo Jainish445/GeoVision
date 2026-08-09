@@ -1,0 +1,38 @@
+# ───────────────────────────────────────────────────────────────────────────────
+# requirements.txt — Warship Detection & Tracking System
+# Install with: pip install -r requirements.txt
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── Core scientific stack ──────────────────────────────────────────────────────
+numpy>=1.24
+Pillow>=10.0
+scipy>=1.11
+
+# ── Geospatial ─────────────────────────────────────────────────────────────────
+rasterio>=1.3          # GeoTIFF / raster I/O (requires GDAL)
+geopandas>=0.14
+shapely>=2.0
+pyproj>=3.6
+
+# ── Satellite data ingestion ───────────────────────────────────────────────────
+requests>=2.31
+sentinelsat>=1.3       # optional legacy Copernicus API (SciHub)
+
+# ── ML / Detection ─────────────────────────────────────────────────────────────
+torch>=2.1             # choose CPU or CUDA wheel from pytorch.org
+torchvision>=0.16
+ultralytics>=8.1       # YOLOv8
+
+# ── Tracking ───────────────────────────────────────────────────────────────────
+deep-sort-realtime>=1.3.2
+
+# ── Dashboard ──────────────────────────────────────────────────────────────────
+streamlit>=1.33
+folium>=0.16
+streamlit-folium>=0.20
+pandas>=2.0
+plotly>=5.18           # optional extra charts
+
+# ── Dev / Testing ──────────────────────────────────────────────────────────────
+pytest>=8.0
+tqdm>=4.66
