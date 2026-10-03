@@ -15,6 +15,7 @@ Run with:
 import sys
 import json
 import datetime
+import math
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,7 +45,10 @@ try:
 except ImportError:
     HAS_FOLIUM = False
 
-from config import WARSHIP_CLASSES, REGIONS_OF_INTEREST, MAP_DEFAULT_CENTER
+from config import (
+    WARSHIP_CLASSES, REGIONS_OF_INTEREST, MAP_DEFAULT_CENTER, MAP_DEFAULT_ZOOM,
+    CIVILIAN_LABEL, UNIDENTIFIED_LABEL,
+)
 from geo.geodb import GeoDB
 
 
@@ -58,7 +62,21 @@ WARSHIP_COLORS = {
     "Amphibious Assault":     "#2980b9",
     "Patrol / Corvette":      "#27ae60",
     "Unknown Warship":        "#7f8c8d",
+    CIVILIAN_LABEL:           "#ecf0f1",
+    UNIDENTIFIED_LABEL:       "#566573",
 }
+
+# What a label rests on, in plain words
+EVIDENCE_TEXT = {
+    "cnn":      "CNN on image",
+    "ais":      "AIS broadcast",
+    "ais+size": "AIS (military) + hull size",
+    "context":  "crowded commercial waters",
+    "size":     "none — hull size only",
+}
+
+# Everything a detection can be labelled as (classifier classes + AIS civilian)
+ALL_TYPES = list(WARSHIP_CLASSES) + [CIVILIAN_LABEL, UNIDENTIFIED_LABEL]
 
 WARSHIP_ICONS = {
     "Aircraft Carrier":       "⬡",
@@ -87,7 +105,18 @@ def load_detections(region: Optional[str], since: Optional[str]) -> pd.DataFrame
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df = df.dropna(subset=["lat", "lon"])
+    # Nullable ints: track IDs render as 3 rather than 3.0, missing as <NA>
+    df["track_id"] = df["track_id"].astype("Int64")
     return df
+
+
+def _fmt(value, spec: str = "", missing: str = "—") -> str:
+    """Format a DB value for display, tolerating None / NaN / <NA>."""
+    if value is None or value is pd.NA:
+        return missing
+    if isinstance(value, float) and math.isnan(value):
+        return missing
+    return format(value, spec) if spec else str(value)
 
 
 @st.cache_data(ttl=60)
@@ -167,18 +196,22 @@ def build_map(df: pd.DataFrame, tracks: List[dict], show_trails: bool) -> "foliu
 
     m = folium.Map(
         location=MAP_DEFAULT_CENTER,
-        zoom_start=3,
+        zoom_start=MAP_DEFAULT_ZOOM,
         tiles=None,
         prefer_canvas=True,
     )
 
-    # Dark tile layer
+    # Dark tile layer. (CARTO's dark_all tiles now require an API key and
+    # render an "API KEY REQUIRED" watermark, so use Esri's keyless basemap.)
     folium.TileLayer(
-        "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        attr="CartoDB",
-        name="CartoDB Dark",
-        max_zoom=19,
+        "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
+        "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ",
+        name="Esri Dark Gray",
+        max_zoom=16,
     ).add_to(m)
+    folium.TileLayer("OpenStreetMap", name="OpenStreetMap", show=False).add_to(m)
+    folium.LayerControl(position="topright", collapsed=True).add_to(m)
 
     # Track trails
     if show_trails:
@@ -188,7 +221,7 @@ def build_map(df: pd.DataFrame, tracks: List[dict], show_trails: bool) -> "foliu
                 continue
             coords = [[p["lat"], p["lon"]] for p in trail if "lat" in p and "lon" in p]
             if len(coords) >= 2:
-                wtype = track.get("warship_type", "Unknown Warship") or "Unknown Warship"
+                wtype = track.get("warship_type") or UNIDENTIFIED_LABEL
                 color = WARSHIP_COLORS.get(wtype, "#7f8c8d")
                 folium.PolyLine(
                     locations=coords,
@@ -200,21 +233,32 @@ def build_map(df: pd.DataFrame, tracks: List[dict], show_trails: bool) -> "foliu
 
     # Ship markers
     for _, row in df.iterrows():
-        wtype = row.get("warship_type") or "Unknown Warship"
+        wtype = row.get("warship_type") or UNIDENTIFIED_LABEL
         color = WARSHIP_COLORS.get(wtype, "#7f8c8d")
-        conf  = float(row.get("confidence", 0))
+        size_class = row.get("size_class")
+        size_class = f"{size_class}-sized" if isinstance(size_class, str) else "—"
+        evidence = EVIDENCE_TEXT.get(row.get("type_source"), "—")
+        conf  = float(row.get("confidence") or 0)
+        size  = "—"
+        if _fmt(row.get("length_m")) != "—":
+            size = f"{_fmt(row.get('length_m'), '.0f')} × {_fmt(row.get('beam_m'), '.0f')} m"
 
         popup_html = f"""
         <div style='font-family:monospace;font-size:12px;min-width:200px;'>
-          <b style='color:{color};font-size:14px;'>{wtype}</b><br>
+          <b style='color:#222;font-size:14px;'>
+            <span style='color:{color};'>●</span> {wtype}</b><br>
           <hr style='border-color:#333;margin:4px 0;'>
-          Track ID:    <b>{row.get('track_id','—')}</b><br>
-          Confidence:  <b>{conf:.1%}</b><br>
+          Track ID:    <b>{_fmt(row.get('track_id'))}</b><br>
+          Detection:   <b>{conf:.1%}</b><br>
+          Evidence:    <b>{evidence}</b><br>
+          Type conf.:  <b>{_fmt(row.get('warship_conf'), '.0%')}</b><br>
+          Hull size:   <b>{size}</b><br>
+          Size class:  <b>{size_class}</b><br>
           Lat / Lon:   <b>{row['lat']:.4f}, {row['lon']:.4f}</b><br>
-          Vessel:      <b>{row.get('vessel_name') or '—'}</b><br>
-          MMSI:        <b>{row.get('vessel_mmsi') or '—'}</b><br>
-          Flag:        <b>{row.get('vessel_flag') or '—'}</b><br>
-          Time:        <b>{(row.get('timestamp') or '')[:19]}</b>
+          Vessel:      <b>{_fmt(row.get('vessel_name') or None)}</b><br>
+          MMSI:        <b>{_fmt(row.get('vessel_mmsi') or None)}</b><br>
+          Flag:        <b>{_fmt(row.get('vessel_flag') or None)}</b><br>
+          Time:        <b>{_fmt(row.get('timestamp') or None)[:19]}</b>
         </div>
         """
 
@@ -230,6 +274,12 @@ def build_map(df: pd.DataFrame, tracks: List[dict], show_trails: bool) -> "foliu
             popup=folium.Popup(popup_html, max_width=280),
         ).add_to(m)
 
+    # Zoom to the data instead of the whole world
+    if not df.empty:
+        pad = 0.5
+        m.fit_bounds([[df["lat"].min() - pad, df["lon"].min() - pad],
+                      [df["lat"].max() + pad, df["lon"].max() + pad]])
+
     return m
 
 
@@ -241,21 +291,23 @@ def render_sidebar():
 
     region = st.sidebar.selectbox(
         "Region of Interest",
-        ["All Regions"] + list(REGIONS_OF_INTEREST.keys()),
+        # configured regions plus any custom ones (--bbox / --local-dir runs)
+        ["All Regions"] + list(REGIONS_OF_INTEREST.keys())
+        + sorted(set(load_summary().get("regions", [])) - set(REGIONS_OF_INTEREST)),
         help="Filter map and table to a specific maritime region.",
     )
 
     days = st.sidebar.slider("Show last N days", 1, 30, 7)
-    since = (datetime.datetime.utcnow()
-             - datetime.timedelta(days=days)).isoformat()
+    since = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     show_trails = st.sidebar.toggle("Show Track Trails", value=True)
 
     st.sidebar.markdown("---")
     wtype_filter = st.sidebar.multiselect(
-        "Warship Types",
-        options=WARSHIP_CLASSES,
-        default=WARSHIP_CLASSES,
+        "Vessel Types",
+        options=ALL_TYPES,
+        default=ALL_TYPES,
     )
 
     conf_min = st.sidebar.slider("Min Confidence", 0.0, 1.0, 0.40, 0.05)
@@ -266,10 +318,10 @@ def render_sidebar():
     if run_demo:
         with st.spinner("Loading demo data …"):
             from pipeline import WarshipPipeline
-            pipe = WarshipPipeline(enable_ais=False, enable_classifier=False)
+            pipe = WarshipPipeline(enable_ais=False, enable_classifier=True)
             pipe.run_demo()
-        st.success("Demo data loaded! Refresh the page.")
         st.cache_data.clear()
+        st.rerun()
 
     return {
         "region":       None if region == "All Regions" else region,
@@ -312,6 +364,13 @@ def main():
             df = df[df["warship_type"].isin(filters["wtype_filter"])
                     | df["warship_type"].isna()]
 
+    # Only draw trails / list tracks for vessels that survive the filters
+    if df.empty:
+        tracks = []
+    else:
+        visible = set(df["track_id"].dropna().astype(int))
+        tracks = [t for t in tracks if t["track_id"] in visible]
+
     # ── KPI cards
     st.markdown("---")
     k1, k2, k3, k4 = st.columns(4)
@@ -344,7 +403,9 @@ def main():
                     "Try clicking **Load Demo Data** in the sidebar.")
         else:
             fmap = build_map(df, tracks, filters["show_trails"])
-            st_folium(fmap, use_container_width=True, height=560)
+            # returned_objects=[] → panning/zooming doesn't re-run the app
+            st_folium(fmap, use_container_width=True, height=560,
+                      returned_objects=[])
 
             # Legend
             st.markdown("**Legend:**")
@@ -362,6 +423,7 @@ def main():
         else:
             display_cols = [
                 "timestamp", "region", "track_id", "warship_type",
+                "type_source", "size_class", "warship_conf", "length_m", "beam_m",
                 "confidence", "lat", "lon", "vessel_name", "vessel_flag",
             ]
             display_cols = [c for c in display_cols if c in df.columns]
@@ -379,7 +441,7 @@ def main():
             track_df = pd.DataFrame([
                 {
                     "Track ID":     t["track_id"],
-                    "Warship Type": t.get("warship_type") or "Unknown",
+                    "Warship Type": t.get("warship_type") or UNIDENTIFIED_LABEL,
                     "Vessel Name":  t.get("vessel_name") or "—",
                     "Flag":         t.get("vessel_flag") or "—",
                     "MMSI":         t.get("vessel_mmsi") or "—",
@@ -413,19 +475,20 @@ def main():
         with c1:
             st.markdown("**GeoJSON Export**")
             if not df.empty:
-                features = []
-                for _, row in df.iterrows():
-                    if row["lat"] and row["lon"]:
-                        features.append({
-                            "type": "Feature",
-                            "geometry": {"type": "Point",
-                                         "coordinates": [row["lon"], row["lat"]]},
-                            "properties": {
-                                k: (v if not pd.isna(v) else None)
-                                for k, v in row.items()
-                                if k not in ("lat", "lon")
-                            },
-                        })
+                # to_json converts numpy scalars and NaN/NA to plain JSON values
+                records = json.loads(df.to_json(orient="records"))
+                features = [
+                    {
+                        "type": "Feature",
+                        "geometry": {"type": "Point",
+                                     "coordinates": [rec["lon"], rec["lat"]]},
+                        "properties": {
+                            k: v for k, v in rec.items()
+                            if k not in ("lat", "lon")
+                        },
+                    }
+                    for rec in records
+                ]
                 geojson_str = json.dumps({
                     "type": "FeatureCollection",
                     "features": features,

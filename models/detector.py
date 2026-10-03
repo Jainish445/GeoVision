@@ -26,8 +26,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
-    YOLO_WEIGHTS, YOLO_CONF_THRESHOLD, YOLO_IOU_THRESHOLD,
-    YOLO_IMGSZ, TILE_SIZE_PX,
+    YOLO_WEIGHTS, YOLO_BASE_WEIGHTS, YOLO_CONF_THRESHOLD, YOLO_IOU_THRESHOLD,
+    YOLO_IMGSZ, TILE_SIZE_PX, DETECT_MAX_SHIP_M,
 )
 from utils.logger import get_logger
 
@@ -55,6 +55,13 @@ class Detection:
     # Set by classifier
     warship_type:      Optional[str]  = None
     warship_conf:      Optional[float] = None
+    length_m:          Optional[float] = None   # measured hull length
+    beam_m:            Optional[float] = None   # measured hull width
+    # Which warship type has a hull this size (a size class, not an identification)
+    size_class:        Optional[str]  = None
+    size_conf:         Optional[float] = None
+    # What the warship_type rests on: "cnn", "ais", "ais+size", "context", "size"
+    type_source:       Optional[str]  = None
 
     # AIS-enriched fields
     vessel_name:  Optional[str] = None
@@ -80,6 +87,10 @@ class Detection:
             "track_id":     self.track_id,
             "warship_type": self.warship_type,
             "warship_conf": self.warship_conf,
+            "length_m":     self.length_m,
+            "beam_m":       self.beam_m,
+            "size_class":   self.size_class,
+            "type_source":  self.type_source,
             "vessel_name":  self.vessel_name,
             "vessel_mmsi":  self.vessel_mmsi,
             "vessel_flag":  self.vessel_flag,
@@ -94,7 +105,7 @@ class ShipDetector:
     YOLOv8-based ship detector.
 
     On first call the model weights are loaded once and cached.
-    Falls back to generic 'yolov8m.pt' (COCO) if fine-tuned weights
+    Falls back to the generic COCO base weights if fine-tuned weights
     are not yet available; the ship class index is then mapped correctly.
     """
 
@@ -115,6 +126,7 @@ class ShipDetector:
         self.imgsz    = imgsz
         self.device   = device
         self._model   = None
+        self._custom_model = False
 
     def _load_model(self):
         """Lazy-load YOLOv8 model."""
@@ -134,10 +146,20 @@ class ShipDetector:
             self._custom_model = True
         else:
             log.warning(
-                "Fine-tuned weights not found at %s — using generic YOLOv8m.",
+                "Fine-tuned weights not found at %s — using generic YOLOv8m "
+                "(COCO 'boat' class only; expect poor recall on SAR imagery).",
                 self.weights,
             )
-            self._model = YOLO("yolov8m.pt")
+            # Absolute path: ultralytics downloads here if missing, and a stale
+            # file in the current working directory can't shadow it.
+            try:
+                self._model = YOLO(str(YOLO_BASE_WEIGHTS))
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not load base weights {YOLO_BASE_WEIGHTS} ({e}). "
+                    "If the file is corrupt (e.g. an interrupted download), "
+                    "delete it and re-run so it is downloaded again."
+                ) from e
             self._custom_model = False
 
         log.info("Model loaded on device: %s", self.device)
@@ -285,19 +307,57 @@ class ShipDetector:
         cx: float, cy: float, geo: Optional[dict]
     ) -> Tuple[Optional[float], Optional[float]]:
         """
-        Interpolate geographic lat/lon for a pixel (cx, cy) within the tile,
-        using the tile's top-left and bottom-right corners stored in the sidecar.
+        Interpolate geographic lat/lon for a pixel (cx, cy) within the tile.
+
+        Uses bilinear interpolation over all four tile corners when the
+        sidecar has them (needed for rotated grids such as Sentinel-1 GRD),
+        otherwise falls back to the top-left / bottom-right corners.
         """
         if geo is None:
             return None, None
         if not all(k in geo for k in ("lat_tl", "lon_tl", "lat_br", "lon_br")):
             return None, None
 
-        frac_x = cx / TILE_SIZE_PX
-        frac_y = cy / TILE_SIZE_PX
-        lon = geo["lon_tl"] + frac_x * (geo["lon_br"] - geo["lon_tl"])
-        lat = geo["lat_tl"] + frac_y * (geo["lat_br"] - geo["lat_tl"])
+        size = geo.get("tile_size", TILE_SIZE_PX)
+        fx = cx / size
+        fy = cy / size
+
+        if all(k in geo for k in ("lat_tr", "lon_tr", "lat_bl", "lon_bl")):
+            def bilinear(key: str) -> float:
+                top = geo[f"{key}_tl"] + fx * (geo[f"{key}_tr"] - geo[f"{key}_tl"])
+                bot = geo[f"{key}_bl"] + fx * (geo[f"{key}_br"] - geo[f"{key}_bl"])
+                return top + fy * (bot - top)
+            return round(bilinear("lat"), 6), round(bilinear("lon"), 6)
+
+        lon = geo["lon_tl"] + fx * (geo["lon_br"] - geo["lon_tl"])
+        lat = geo["lat_tl"] + fy * (geo["lat_br"] - geo["lat_tl"])
         return round(lat, 6), round(lon, 6)
+
+    # ── Size sanity filter ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def filter_by_size(
+        detections: List[Detection],
+        max_length_m: float = DETECT_MAX_SHIP_M,
+    ) -> List[Detection]:
+        """
+        Drop detections whose box is longer than any ship. On real coastal
+        scenes these are islets, breakwaters and piers.
+        """
+        geo_cache: dict = {}
+        keep = []
+        for d in detections:
+            key = str(d.tile_path)
+            if key not in geo_cache:
+                geo_cache[key] = ShipDetector._load_geo(Path(d.tile_path)) or {}
+            gsd_m = geo_cache[key].get("gsd_m", 10.0)
+            x1, y1, x2, y2 = d.bbox_px
+            if max(x2 - x1, y2 - y1) * gsd_m <= max_length_m:
+                keep.append(d)
+        if len(keep) < len(detections):
+            log.info("Dropped %d detection(s) larger than %.0f m (not ships).",
+                     len(detections) - len(keep), max_length_m)
+        return keep
 
     # ── NMS across tiles ───────────────────────────────────────────────────────
 
@@ -308,25 +368,50 @@ class ShipDetector:
     ) -> List[Detection]:
         """
         Suppress duplicate detections caused by overlapping tiles.
-        Uses a simple greedy IoU-based NMS in geographic space.
+
+        Greedy NMS in geographic space. A ship in the overlap strip is seen by
+        two tiles, and one of them often sees only part of it, so the two box
+        centres can be far more than a few pixels apart. Detections from
+        different tiles are therefore merged when their centres are closer
+        than half the larger box; boxes cut by a tile edge lose to complete ones.
         """
         if not detections:
             return detections
 
-        # Sort by confidence descending
-        dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
+        geo_cache: dict = {}
+
+        def info(d: Detection):
+            """(half box length in km, True if the box touches its tile edge)."""
+            key = str(d.tile_path)
+            if key not in geo_cache:
+                geo_cache[key] = ShipDetector._load_geo(Path(d.tile_path)) or {}
+            geo = geo_cache[key]
+            size = geo.get("tile_size", TILE_SIZE_PX)
+            gsd_m = geo.get("gsd_m", 10.0)
+            x1, y1, x2, y2 = d.bbox_px
+            radius_km = 0.5 * max(x2 - x1, y2 - y1) * gsd_m / 1000.0
+            truncated = min(x1, y1) <= 1 or max(x2, y2) >= size - 1
+            return radius_km, truncated
+
+        meta = {id(d): info(d) for d in detections}
+
+        # Complete boxes first, then by confidence descending
+        dets = sorted(detections,
+                      key=lambda d: (meta[id(d)][1], -d.confidence))
         keep: List[Detection] = []
+
+        def duplicate(best: Detection, d: Detection) -> bool:
+            if best.lat is None or d.lat is None:
+                return False
+            threshold = 0.05      # 50 m — two ships can't occupy the same spot
+            if str(best.tile_path) != str(d.tile_path):
+                threshold = max(threshold, meta[id(best)][0], meta[id(d)][0])
+            return _geo_distance_km(best.lat, best.lon, d.lat, d.lon) <= threshold
 
         while dets:
             best = dets.pop(0)
             keep.append(best)
-            dets = [
-                d for d in dets
-                if best.lat is None
-                or d.lat is None
-                or _geo_distance_km(best.lat, best.lon, d.lat, d.lon) > 0.05
-                # 50 m threshold — two ships can't occupy same pixel
-            ]
+            dets = [d for d in dets if not duplicate(best, d)]
 
         log.debug("NMS: %d → %d detections after suppression.",
                   len(detections), len(keep))

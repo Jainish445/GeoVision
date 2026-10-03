@@ -285,19 +285,25 @@ def save_geojson(geojson: dict, path: str) -> None:
 # ── Self-test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import sys
+    try:        # Windows consoles default to cp1252, which lacks '≈' and '°'
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
     # Quick sanity checks
     print("haversine_km((0,0),(0,1))     =", round(haversine_km((0, 0), (0, 1)), 3), "km")
     print("haversine_km((51.5,-0.1),(48.9,2.3)) =",
-          round(haversine_km((51.5, -0.1), (48.9, 2.3)), 1), "km  (London→Paris ≈340 km)")
-    print("bearing (0,0)→(0,1)           =", bearing_degrees((0, 0), (0, 1)), "°  (expect 90)")
-    print("bearing (0,0)→(1,0)           =", bearing_degrees((0, 0), (1, 0)), "°  (expect 0)")
+          round(haversine_km((51.5, -0.1), (48.9, 2.3)), 1), "km  (London->Paris ≈340 km)")
+    print("bearing (0,0)->(0,1)           =", bearing_degrees((0, 0), (0, 1)), "°  (expect 90)")
+    print("bearing (0,0)->(1,0)           =", bearing_degrees((0, 0), (1, 0)), "°  (expect 0)")
 
     bbox = (0.0, 99.0, 25.0, 125.0)
     cells = split_bbox_grid(bbox, cell_deg=5.0)
-    print(f"split_bbox_grid South China Sea (5°) → {len(cells)} cells")
+    print(f"split_bbox_grid South China Sea (5°) -> {len(cells)} cells")
 
     proj = estimate_next_position([
         {"lat": 15.0, "lon": 114.0, "timestamp": "2024-01-15T00:00:00Z"},
         {"lat": 15.1, "lon": 114.1, "timestamp": "2024-01-15T06:00:00Z"},
     ], hours_ahead=6.0)
-    print(f"estimate_next_position (6h ahead) → {proj}")
+    print(f"estimate_next_position (6h ahead) -> {proj}")

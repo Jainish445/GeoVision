@@ -2,7 +2,7 @@
 data/dataset.py — Dataset download and management utilities.
 
 Handles:
-  • SAR-Ship dataset (Sentinel-1 chips, PASCAL VOC labels)
+  • SAR-Ship dataset (Sentinel-1 chips, YOLO or PASCAL VOC labels)
   • HRSC2016 (optical, fine-grained warship types)
   • Roboflow project download (YOLO format)
   • Dataset statistics and class distribution
@@ -35,7 +35,7 @@ from utils.logger import get_logger
 log = get_logger("dataset")
 
 # Default output directory for all dataset operations
-DEFAULT_DATASET_DIR = Path("data/dataset")
+DEFAULT_DATASET_DIR = Path(__file__).resolve().parent / "dataset"
 
 
 class DatasetManager:
@@ -121,12 +121,12 @@ class DatasetManager:
         seed: int = 42,
     ) -> Path:
         """
-        Convert SAR-Ship dataset from PASCAL VOC XML format to YOLO format.
+        Split the SAR-Ship dataset into a YOLO train/val dataset.
 
-        Expected input structure:
-            raw_dir/
-              Annotations/   *.xml
-              JPEGImages/    *.jpg  or  *.png
+        Accepted input layouts:
+            raw_dir/*.jpg + raw_dir/*.txt              (YOLO labels, flat)
+            raw_dir/images/ + raw_dir/labels/          (YOLO .txt or VOC .xml)
+            raw_dir/JPEGImages/ + raw_dir/Annotations/ (PASCAL VOC .xml)
 
         Output structure (YOLO):
             output_dir/
@@ -136,99 +136,71 @@ class DatasetManager:
               labels/val/
               data.yaml
         """
-        import xml.etree.ElementTree as ET
-
         raw_dir    = Path(raw_dir)
         output_dir = Path(output_dir or self.dataset_dir / "sar_ship")
 
-        ann_dir = raw_dir / "Annotations"
-        img_dir = raw_dir / "JPEGImages"
+        if not raw_dir.exists():
+            raise FileNotFoundError(f"Dataset directory not found: {raw_dir}")
 
-        if not ann_dir.exists():
-            # Try alternative layout (images + labels at root)
-            ann_dir = raw_dir / "labels"
-            img_dir = raw_dir / "images"
+        if (raw_dir / "Annotations").exists():
+            ann_dir, img_dir = raw_dir / "Annotations", raw_dir / "JPEGImages"
+        elif (raw_dir / "labels").exists():
+            ann_dir, img_dir = raw_dir / "labels", raw_dir / "images"
+        else:
+            ann_dir = img_dir = raw_dir
 
-        xml_files = sorted(ann_dir.glob("*.xml"))
-        if not xml_files:
-            raise FileNotFoundError(f"No XML annotation files found in {ann_dir}")
+        # Index images once (a per-file exists() check is slow on 40k files)
+        images = {
+            p.stem: p for p in img_dir.iterdir()
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".tif")
+        } if img_dir.exists() else {}
 
-        log.info("Found %d annotation files in %s", len(xml_files), ann_dir)
+        ann_files = sorted(ann_dir.glob("*.xml")) or sorted(
+            p for p in ann_dir.glob("*.txt") if p.stem in images
+        )
+        if not ann_files:
+            raise FileNotFoundError(
+                f"No annotation files (*.xml or YOLO *.txt) found in {ann_dir}"
+            )
 
-        random.seed(seed)
-        random.shuffle(xml_files)
-        split_idx = int(len(xml_files) * train_ratio)
+        log.info("Found %d annotation files in %s", len(ann_files), ann_dir)
+
+        random.Random(seed).shuffle(ann_files)
+        split_idx = int(len(ann_files) * train_ratio)
         splits = {
-            "train": xml_files[:split_idx],
-            "val":   xml_files[split_idx:],
+            "train": ann_files[:split_idx],
+            "val":   ann_files[split_idx:],
         }
 
         converted = {"train": 0, "val": 0}
 
-        for split_name, xml_list in splits.items():
+        for split_name, ann_list in splits.items():
             out_img = output_dir / "images" / split_name
             out_lbl = output_dir / "labels" / split_name
             out_img.mkdir(parents=True, exist_ok=True)
             out_lbl.mkdir(parents=True, exist_ok=True)
 
-            for xml_path in xml_list:
-                stem = xml_path.stem
-
-                # Find the image
-                img_path = None
-                for ext in [".jpg", ".jpeg", ".png", ".tif"]:
-                    candidate = img_dir / (stem + ext)
-                    if candidate.exists():
-                        img_path = candidate
-                        break
-
+            for ann_path in ann_list:
+                stem = ann_path.stem
+                img_path = images.get(stem)
                 if img_path is None:
                     log.warning("Image not found for %s — skipping.", stem)
                     continue
 
-                # Parse XML
-                try:
-                    tree = ET.parse(xml_path)
-                    root = tree.getroot()
-                    size = root.find("size")
-                    W    = int(size.find("width").text)
-                    H    = int(size.find("height").text)
-                except Exception as e:
-                    log.warning("Bad XML %s: %s", xml_path.name, e)
+                if ann_path.suffix == ".xml":
+                    lines = self._voc_to_yolo(ann_path)
+                else:
+                    lines = self._clean_yolo(ann_path)
+                if lines is None:
                     continue
 
-                lines = []
-                for obj in root.findall("object"):
-                    bnd = obj.find("bndbox")
-                    if bnd is None:
-                        continue
-                    x1 = float(bnd.find("xmin").text)
-                    y1 = float(bnd.find("ymin").text)
-                    x2 = float(bnd.find("xmax").text)
-                    y2 = float(bnd.find("ymax").text)
-
-                    cx = (x1 + x2) / (2 * W)
-                    cy = (y1 + y2) / (2 * H)
-                    bw = (x2 - x1) / W
-                    bh = (y2 - y1) / H
-
-                    # Clamp to [0, 1]
-                    cx = max(0.0, min(1.0, cx))
-                    cy = max(0.0, min(1.0, cy))
-                    bw = max(0.0, min(1.0, bw))
-                    bh = max(0.0, min(1.0, bh))
-
-                    lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-
-                if not lines:
-                    continue
-
+                # Images without ships are kept as background (empty label)
                 shutil.copy2(img_path, out_img / img_path.name)
                 (out_lbl / (stem + ".txt")).write_text("\n".join(lines))
                 converted[split_name] += 1
 
         # Write data.yaml
-        yaml_content = f"""path: {output_dir.resolve()}
+        yaml_content = f"""path: {output_dir.resolve().as_posix()}
 train: images/train
 val:   images/val
 
@@ -243,6 +215,55 @@ names:
             converted["train"], converted["val"],
         )
         return output_dir
+
+    @staticmethod
+    def _clean_yolo(txt_path: Path) -> Optional[List[str]]:
+        """Validate a YOLO label file; every box becomes class 0 (ship)."""
+        lines = []
+        for line in txt_path.read_text().splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            try:
+                cx, cy, bw, bh = (min(1.0, max(0.0, float(v))) for v in parts[1:5])
+            except ValueError:
+                log.warning("Bad label %s — skipping.", txt_path.name)
+                return None
+            if len(parts) < 5 or bw <= 0 or bh <= 0:
+                continue
+            lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        return lines
+
+    @staticmethod
+    def _voc_to_yolo(xml_path: Path) -> Optional[List[str]]:
+        """Convert one PASCAL VOC annotation to YOLO lines (class 0)."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.parse(xml_path).getroot()
+            size = root.find("size")
+            W    = int(size.find("width").text)
+            H    = int(size.find("height").text)
+        except Exception as e:
+            log.warning("Bad XML %s: %s", xml_path.name, e)
+            return None
+
+        lines = []
+        for obj in root.findall("object"):
+            bnd = obj.find("bndbox")
+            if bnd is None:
+                continue
+            x1 = float(bnd.find("xmin").text)
+            y1 = float(bnd.find("ymin").text)
+            x2 = float(bnd.find("xmax").text)
+            y2 = float(bnd.find("ymax").text)
+
+            cx = max(0.0, min(1.0, (x1 + x2) / (2 * W)))
+            cy = max(0.0, min(1.0, (y1 + y2) / (2 * H)))
+            bw = max(0.0, min(1.0, (x2 - x1) / W))
+            bh = max(0.0, min(1.0, (y2 - y1) / H))
+            lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        return lines
 
     # ── HRSC2016 ───────────────────────────────────────────────────────────────
 
@@ -350,10 +371,73 @@ names:
 
         # data.yaml
         class_names = [f"  - {c}" for c in (WARSHIP_CLASSES if use_subtypes else ["ship"])]
-        yaml_str = (f"path: {output_dir.resolve()}\ntrain: images/train\nval: images/val\n\n"
+        yaml_str = (f"path: {output_dir.resolve().as_posix()}\ntrain: images/train\nval: images/val\n\n"
                     f"nc: {nc}\nnames:\n" + "\n".join(class_names) + "\n")
         (output_dir / "data.yaml").write_text(yaml_str)
         log.info("HRSC2016 conversion complete → %s", output_dir)
+        return output_dir
+
+    # ── FGSC-23 (classifier training data) ─────────────────────────────────────
+
+    # FGSC-23 ship-ID → classifier class. IDs not listed (0 = non-ship) are skipped.
+    FGSC23_CLASS_MAP = {
+        1:  "Aircraft Carrier",
+        2:  "Destroyer",
+        4:  "Frigate",
+        6:  "Cruiser",
+        10: "Submarine (surfaced)",
+        5:  "Amphibious Assault",     # amphibious transport dock
+        7:  "Amphibious Assault",     # Tarawa-class
+        8:  "Amphibious Assault",
+        12: "Patrol / Corvette",      # combat boat
+        3:  "Unknown Warship",        # landing craft
+        9:  "Unknown Warship",        # command ship
+        11: "Unknown Warship",        # medical ship
+        13: "Unknown Warship",        # auxiliary ship
+        16: "Unknown Warship",        # hovercraft
+        14: "Civilian Vessel", 15: "Civilian Vessel", 17: "Civilian Vessel",
+        18: "Civilian Vessel", 19: "Civilian Vessel", 20: "Civilian Vessel",
+        21: "Civilian Vessel", 22: "Civilian Vessel",
+    }
+
+    def prepare_fgsc23(self, raw_dir: Path, output_dir: Optional[Path] = None) -> Path:
+        """
+        Arrange the FGSC-23 fine-grained ship dataset into the folder layout
+        models/classifier.py trains on, keeping its train/test split:
+
+            output_dir/train/<class>/*.jpg
+            output_dir/test/<class>/*.jpg
+
+        Download (research use only):
+            https://huggingface.co/datasets/jbourcier/fgsc23
+        """
+        raw_dir = Path(raw_dir)
+        if (raw_dir / "FGSC-23").exists():
+            raw_dir = raw_dir / "FGSC-23"
+        output_dir = Path(output_dir or self.dataset_dir.parent / "classifier")
+
+        def safe(name: str) -> str:      # "Patrol / Corvette" is not a valid folder name
+            return "_".join("".join(c if c.isalnum() else " " for c in name).split())
+
+        counts: Dict[str, Dict[str, int]] = {}
+        for split in ("train", "test"):
+            split_dir = raw_dir / split
+            if not split_dir.exists():
+                raise FileNotFoundError(f"FGSC-23 '{split}' folder not found in {raw_dir}")
+            for ship_id, cls in self.FGSC23_CLASS_MAP.items():
+                src = split_dir / str(ship_id)
+                if not src.exists():
+                    continue
+                dst = output_dir / split / safe(cls)
+                dst.mkdir(parents=True, exist_ok=True)
+                for img in src.iterdir():
+                    if img.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"):
+                        shutil.copy2(img, dst / img.name)
+                        counts.setdefault(cls, {"train": 0, "test": 0})[split] += 1
+
+        for cls, c in sorted(counts.items()):
+            log.info("  %-22s train=%4d  test=%4d", cls, c["train"], c["test"])
+        log.info("FGSC-23 prepared → %s", output_dir)
         return output_dir
 
     # ── Dataset Statistics ─────────────────────────────────────────────────────
@@ -465,6 +549,12 @@ if __name__ == "__main__":
     p_hrsc.add_argument("--output-dir",    type=Path, default=None)
     p_hrsc.add_argument("--use-subtypes",  action="store_true")
 
+    # prepare-fgsc
+    p_fgsc = sub.add_parser("prepare-fgsc",
+                            help="Prepare FGSC-23 for classifier training")
+    p_fgsc.add_argument("--raw-dir",    type=Path, required=True)
+    p_fgsc.add_argument("--output-dir", type=Path, default=None)
+
     # roboflow
     p_rf = sub.add_parser("roboflow", help="Download from Roboflow")
     p_rf.add_argument("--project", required=True, help="workspace/project/version")
@@ -489,6 +579,8 @@ if __name__ == "__main__":
     elif args.cmd == "prepare-hrsc":
         dm.prepare_hrsc2016(args.raw_dir, args.output_dir,
                             use_subtypes=args.use_subtypes)
+    elif args.cmd == "prepare-fgsc":
+        dm.prepare_fgsc23(args.raw_dir, args.output_dir)
     elif args.cmd == "roboflow":
         dm.download_roboflow(args.project, args.api_key, fmt=args.format)
     else:

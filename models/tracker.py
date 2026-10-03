@@ -1,88 +1,117 @@
 """
-models/tracker.py — Multi-object tracking with DeepSORT.
+models/tracker.py — Multi-acquisition ship tracking in geographic space.
 
-Wraps the `deep_sort_realtime` library to assign persistent track IDs
-to ship detections across successive satellite image acquisitions.
+Satellite revisit intervals are measured in hours, and every detection's pixel
+box is relative to its own tile, so video trackers such as DeepSORT (which
+associate pixel boxes between consecutive frames) do not apply here. Instead,
+detections are associated to existing tracks by great-circle distance, gated by
+how far a ship could plausibly have sailed in the elapsed time, and assigned
+optimally with the Hungarian algorithm.
 
-Because satellite revisit intervals are measured in hours (not video frames),
-this module uses a time-aware version of DeepSORT where Kalman filter
-state is propagated using actual elapsed time, not frame count.
+Track state is seeded from the database, so IDs persist across pipeline runs
+(e.g. a cron job every 6 hours) and never collide between regions.
 
 Usage:
     from models.tracker import ShipTracker
-    tracker = ShipTracker()
-    detections = tracker.update(detections, timestamp="2024-01-15T06:30:00Z")
+    tracker = ShipTracker(db=GeoDB())
+    detections = tracker.update(detections, timestamp="2024-01-15T06:30:00Z",
+                                region="South_China_Sea")
 """
 
 import sys
 from pathlib import Path
-from datetime import datetime
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
-    DEEPSORT_MAX_AGE, DEEPSORT_N_INIT,
-    DEEPSORT_MAX_COSINE_DIST, DEEPSORT_NN_BUDGET,
+    TRACK_MAX_SPEED_KNOTS, TRACK_MIN_GATE_KM,
+    TRACK_MAX_GATE_KM, TRACK_MAX_GAP_HOURS,
 )
-from models.detector import Detection
+from models.detector import Detection, _geo_distance_km
 from utils.logger import get_logger
 
 log = get_logger("tracker")
 
+KM_PER_NM = 1.852
+
+
+def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
 
 class ShipTracker:
     """
-    Wraps DeepSORT to maintain ship identities across multiple
-    satellite acquisitions of the same region.
+    Maintains ship identities across satellite acquisitions.
 
     Key design choices:
-    • Uses IoU + appearance (ReID) matching.
-    • A track is "confirmed" after N_INIT consecutive detections.
-    • Dead tracks survive MAX_AGE frames before deletion.
-    • For satellite data, each acquisition counts as one "frame".
+    • Association is done on lat/lon, not pixels.
+    • The search gate grows with elapsed time: MIN_GATE + MAX_SPEED × Δt,
+      capped at MAX_GATE. Tracks unseen for MAX_GAP_HOURS are not continued.
+    • Within the gate, a track with two or more fixes is matched against its
+      dead-reckoned position (constant course and speed), so ships whose
+      paths cross keep their identities. A mismatch in measured hull length
+      (when the classifier has run first) makes a pairing more expensive.
+    • Every detection gets a track ID (a new one if nothing matches).
     """
 
     def __init__(
         self,
-        max_age:         int   = DEEPSORT_MAX_AGE,
-        n_init:          int   = DEEPSORT_N_INIT,
-        max_cosine_dist: float = DEEPSORT_MAX_COSINE_DIST,
-        nn_budget:       int   = DEEPSORT_NN_BUDGET,
+        db=None,                       # optional GeoDB for persistent IDs
+        max_speed_knots: float = TRACK_MAX_SPEED_KNOTS,
+        min_gate_km:     float = TRACK_MIN_GATE_KM,
+        max_gate_km:     float = TRACK_MAX_GATE_KM,
+        max_gap_hours:   float = TRACK_MAX_GAP_HOURS,
     ):
-        self.max_age         = max_age
-        self.n_init          = n_init
-        self.max_cosine_dist = max_cosine_dist
-        self.nn_budget       = nn_budget
-        self._tracker        = None
-        self._frame_index    = 0
-        self._last_timestamp: Optional[datetime] = None
+        self.db              = db
+        self.max_speed_knots = max_speed_knots
+        self.min_gate_km     = min_gate_km
+        self.max_gate_km     = max_gate_km
+        self.max_gap_hours   = max_gap_hours
 
-        # History: track_id → list of (lat, lon, timestamp) tuples
-        self.track_history: dict = {}
+        # track_id → {"lat", "lon", "ts" (datetime | None), "region",
+        #             "prev" ((lat, lon, ts) | None), "length_m" (float | None)}
+        self._tracks: Dict[int, dict] = {}
+        self._next_id = 1
+        self._loaded  = False
+        self._frame_index = 0
 
-    def _load_tracker(self):
-        """Lazy-initialise DeepSORT (avoids import-time crash if not installed)."""
-        if self._tracker is not None:
+        # History: track_id → list of {lat, lon, timestamp, confidence} dicts
+        self.track_history: Dict[int, List[dict]] = {}
+
+    def _load_state(self):
+        """Seed last-known positions and the ID counter from the database."""
+        if self._loaded:
+            return
+        self._loaded = True
+        if self.db is None:
             return
 
-        try:
-            from deep_sort_realtime.deepsort_tracker import DeepSort
-        except ImportError:
-            raise ImportError(
-                "deep_sort_realtime not installed. "
-                "Run: pip install deep-sort-realtime"
-            )
-
-        self._tracker = DeepSort(
-            max_age=self.max_age,
-            n_init=self.n_init,
-            max_cosine_distance=self.max_cosine_dist,
-            nn_budget=self.nn_budget,
-        )
-        log.info("DeepSORT tracker initialised (max_age=%d, n_init=%d).",
-                 self.max_age, self.n_init)
+        for t in self.db.query_tracks():
+            trail = t.get("trail") or []
+            if not trail:
+                continue
+            last = trail[-1]
+            prev = trail[-2] if len(trail) > 1 else None
+            self._tracks[t["track_id"]] = {
+                "lat": last["lat"], "lon": last["lon"],
+                "ts": _parse_ts(last.get("timestamp")),
+                "region": t.get("region"),
+                "prev": (prev["lat"], prev["lon"], _parse_ts(prev.get("timestamp")))
+                        if prev else None,
+                "length_m": None,
+            }
+            self.track_history[t["track_id"]] = list(trail)
+        self._next_id = max(self._next_id, self.db.next_track_id())
+        log.info("Tracker seeded with %d existing track(s).", len(self._tracks))
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -90,130 +119,129 @@ class ShipTracker:
         self,
         detections: List[Detection],
         timestamp: Optional[str] = None,
-        image: Optional[np.ndarray] = None,   # optional: H×W×3 tile for ReID
+        region: Optional[str] = None,
     ) -> List[Detection]:
         """
         Feed detections from one satellite acquisition into the tracker.
 
         Args:
-            detections: List of Detection objects from the detector.
-            timestamp:  ISO-8601 string of the acquisition time.
-            image:      Optional full-scene image for appearance embedding.
+            detections: Detection objects with lat/lon populated.
+            timestamp:  ISO-8601 acquisition time.
+            region:     Region name; tracks are only matched within a region.
 
         Returns:
-            Same list, with track_id field populated on confirmed tracks.
+            Same list, with track_id populated on every geolocated detection.
         """
-        self._load_tracker()
+        self._load_state()
         self._frame_index += 1
+        now = _parse_ts(timestamp)
 
-        if timestamp:
-            try:
-                self._last_timestamp = datetime.fromisoformat(
-                    timestamp.replace("Z", "+00:00")
-                )
-            except ValueError:
-                pass
-
-        # Build DeepSORT-format input: list of ([left, top, w, h], conf, class)
-        raw_dets = []
-        for d in detections:
-            x1, y1, x2, y2 = d.bbox_px
-            w, h = x2 - x1, y2 - y1
-            raw_dets.append(([x1, y1, w, h], d.confidence, d.class_name))
-
-        if not raw_dets:
-            log.debug("Frame %d: no detections to track.", self._frame_index)
+        located = [d for d in detections if d.lat is not None and d.lon is not None]
+        if not located:
+            log.debug("Frame %d: no geolocated detections to track.", self._frame_index)
             return detections
 
-        # Run tracking step
-        tracks = self._tracker.update_tracks(raw_dets, frame=image)
+        # Candidate tracks: same region, seen recently enough, not in the future
+        cand_ids, gates = [], []
+        for tid, t in self._tracks.items():
+            if region is not None and t["region"] not in (None, region):
+                continue
+            if now is not None and t["ts"] is not None:
+                gap_h = (now - t["ts"]).total_seconds() / 3600.0
+                if gap_h < 0 or gap_h > self.max_gap_hours:
+                    continue
+            else:
+                gap_h = 0.0
+            gate = self.min_gate_km + self.max_speed_knots * KM_PER_NM * gap_h
+            cand_ids.append(tid)
+            gates.append(min(gate, self.max_gate_km))
 
-        # Map confirmed tracks back to detections by IoU overlap
-        confirmed = [t for t in tracks if t.is_confirmed()]
-        log.info("Frame %d: %d detection(s) → %d confirmed track(s).",
-                 self._frame_index, len(detections), len(confirmed))
+        matches: Dict[int, int] = {}     # detection index → track id
+        if cand_ids:
+            from scipy.optimize import linear_sum_assignment
 
-        assigned = self._assign_tracks_to_detections(detections, confirmed)
+            BIG = 1e9
+            cost = np.full((len(located), len(cand_ids)), BIG)
+            for i, d in enumerate(located):
+                for j, tid in enumerate(cand_ids):
+                    t = self._tracks[tid]
+                    # Gate on physical reachability from the last fix …
+                    dist = _geo_distance_km(d.lat, d.lon, t["lat"], t["lon"])
+                    if dist > gates[j]:
+                        continue
+                    # … but rank candidates by distance to the predicted position
+                    p_lat, p_lon = self._predict(t, now)
+                    c = _geo_distance_km(d.lat, d.lon, p_lat, p_lon)
+                    if d.length_m and t.get("length_m"):
+                        big = max(d.length_m, t["length_m"])
+                        c *= 1.0 + 2.0 * abs(d.length_m - t["length_m"]) / big
+                    cost[i, j] = c
+            rows, cols = linear_sum_assignment(cost)
+            for i, j in zip(rows, cols):
+                if cost[i, j] < BIG:
+                    matches[i] = cand_ids[j]
 
-        # Update history
-        for d in assigned:
-            if d.track_id is not None and d.lat is not None:
-                self.track_history.setdefault(d.track_id, [])
-                self.track_history[d.track_id].append({
-                    "lat": d.lat,
-                    "lon": d.lon,
-                    "timestamp": timestamp or "",
-                    "confidence": d.confidence,
-                })
+        n_new = 0
+        for i, d in enumerate(located):
+            tid = matches.get(i)
+            if tid is None:
+                tid = self._next_id
+                self._next_id += 1
+                n_new += 1
+            d.track_id = tid
+            old = self._tracks.get(tid)
+            self._tracks[tid] = {
+                "lat": d.lat, "lon": d.lon, "ts": now, "region": region,
+                "prev": (old["lat"], old["lon"], old["ts"]) if old else None,
+                "length_m": d.length_m or (old or {}).get("length_m"),
+            }
+            self.track_history.setdefault(tid, []).append({
+                "lat": d.lat,
+                "lon": d.lon,
+                "timestamp": timestamp or "",
+                "confidence": d.confidence,
+            })
 
-        return assigned
+        log.info("Frame %d: %d detection(s) → %d matched, %d new track(s).",
+                 self._frame_index, len(located), len(matches), n_new)
+        return detections
+
+    @staticmethod
+    def _predict(t: dict, now: Optional[datetime]):
+        """Dead-reckon a track to `now` from its last two fixes."""
+        prev = t.get("prev")
+        if not prev or now is None or t["ts"] is None or prev[2] is None:
+            return t["lat"], t["lon"]
+        span = (t["ts"] - prev[2]).total_seconds()
+        ahead = (now - t["ts"]).total_seconds()
+        if span <= 0 or ahead <= 0:
+            return t["lat"], t["lon"]
+        k = ahead / span
+        return (t["lat"] + (t["lat"] - prev[0]) * k,
+                t["lon"] + (t["lon"] - prev[1]) * k)
 
     def get_track_trail(self, track_id: int) -> List[dict]:
         """Return the full position history for a given track ID."""
         return self.track_history.get(track_id, [])
 
     def active_track_ids(self) -> List[int]:
-        """Return currently active (confirmed) track IDs."""
-        if self._tracker is None:
-            return []
-        return [
-            t.track_id for t in self._tracker.tracker.tracks
-            if t.is_confirmed()
-        ]
+        """Return all track IDs currently known to the tracker."""
+        return sorted(self._tracks)
 
     def reset(self):
-        """Reset tracker state (call when switching to a new region)."""
-        self._tracker = None
-        self._frame_index = 0
+        """Forget all in-memory state (it is re-seeded from the DB on next use)."""
+        self._tracks.clear()
         self.track_history.clear()
+        self._next_id = 1
+        self._loaded = False
+        self._frame_index = 0
         log.info("Tracker reset.")
-
-    # ── Internal ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _assign_tracks_to_detections(
-        detections: List[Detection],
-        tracks: list,
-    ) -> List[Detection]:
-        """
-        Match confirmed DeepSORT tracks back to Detection objects
-        using centroid proximity (since DeepSORT works in pixel space).
-        """
-        if not tracks:
-            return detections
-
-        # Build track bbox centres
-        track_centres = []
-        track_ids     = []
-        for t in tracks:
-            ltrb = t.to_ltrb()  # [left, top, right, bottom]
-            cx = (ltrb[0] + ltrb[2]) / 2
-            cy = (ltrb[1] + ltrb[3]) / 2
-            track_centres.append((cx, cy))
-            track_ids.append(t.track_id)
-
-        for d in detections:
-            dcx, dcy = d.centre_px
-            best_dist = float("inf")
-            best_tid  = None
-            for (tcx, tcy), tid in zip(track_centres, track_ids):
-                dist = ((dcx - tcx) ** 2 + (dcy - tcy) ** 2) ** 0.5
-                if dist < best_dist:
-                    best_dist = dist
-                    best_tid  = tid
-            # Assign if close enough (within half a tile)
-            if best_dist < 320:
-                d.track_id = best_tid
-
-        return detections
 
 
 # ── Standalone test ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     # Simulate two acquisitions with synthetic detections
-    from models.detector import Detection
-
     tracker = ShipTracker()
 
     acq1 = [
@@ -224,17 +252,15 @@ if __name__ == "__main__":
     ]
     acq2 = [
         Detection(tile_path=Path("tile.png"), bbox_px=(105, 103, 205, 203),
-                  confidence=0.90, class_id=0, lat=20.51, lon=115.21),
+                  confidence=0.90, class_id=0, lat=20.9, lon=115.6),
     ]
 
     print("=== Acquisition 1 ===")
-    r1 = tracker.update(acq1, timestamp="2024-01-15T06:00:00Z")
-    for d in r1:
+    for d in tracker.update(acq1, timestamp="2024-01-15T06:00:00Z"):
         print(f"  Track {d.track_id} at ({d.lat}, {d.lon}) conf={d.confidence:.2f}")
 
     print("\n=== Acquisition 2 (5 hours later) ===")
-    r2 = tracker.update(acq2, timestamp="2024-01-15T11:00:00Z")
-    for d in r2:
+    for d in tracker.update(acq2, timestamp="2024-01-15T11:00:00Z"):
         print(f"  Track {d.track_id} at ({d.lat}, {d.lon}) conf={d.confidence:.2f}")
 
     print("\nTrack history:")

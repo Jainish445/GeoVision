@@ -4,7 +4,7 @@ data/preprocessing.py — Satellite image preprocessing pipeline.
 Steps:
   1. Read GeoTIFF bands from a Sentinel product folder.
   2. Apply cloud masking (Sentinel-2 SCL band).
-  3. Convert SAR backscatter from dB to linear scale.
+  3. Log-stretch SAR amplitude to 8-bit.
   4. Tile large images into TILE_SIZE_PX × TILE_SIZE_PX patches.
   5. Save tiles as PNG with geo-metadata sidecar JSON.
 
@@ -18,7 +18,7 @@ import json
 import sys
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import Callable, List, Optional, Tuple, Dict
 
 # rasterio / GDAL for geospatial raster handling
 try:
@@ -41,9 +41,66 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import TILE_SIZE_PX, TILE_STRIDE, TILES_DIR
+from utils.geo_utils import haversine_km
 from utils.logger import get_logger
 
 log = get_logger("preprocessing")
+
+# (cols, rows) pixel arrays → (lons, lats) in EPSG:4326
+GeoFn = Callable[[List[float], List[float]], Tuple[List[float], List[float]]]
+
+# Percentile stretches are estimated on at most this many pixels
+_MAX_STAT_PIXELS = 4_000_000
+
+
+def _subsample(arr: np.ndarray) -> np.ndarray:
+    """Thin out a large raster so percentile estimation stays fast."""
+    step = int(np.ceil(np.sqrt(arr.size / _MAX_STAT_PIXELS))) if arr.size else 1
+    return arr[::step, ::step] if step > 1 else arr
+
+
+def make_geo_fn(src) -> Optional[GeoFn]:
+    """
+    Build a pixel → lon/lat function for an open rasterio dataset.
+
+    Handles the three cases we meet in practice:
+      • affine transform in a geographic CRS (plain GeoTIFF),
+      • affine transform in a projected CRS (Sentinel-2 is UTM),
+      • no transform but ground control points (Sentinel-1 GRD).
+    Returns None for un-georeferenced rasters.
+    """
+    crs, transform = src.crs, src.transform
+
+    if crs is not None and not transform.is_identity:
+        geographic = crs.is_geographic
+
+        def affine_fn(cols, rows):
+            xs, ys = [], []
+            for c, r in zip(cols, rows):
+                x, y = transform * (c, r)
+                xs.append(x)
+                ys.append(y)
+            if not geographic:
+                from rasterio.warp import transform as warp_transform
+                xs, ys = warp_transform(crs, "EPSG:4326", xs, ys)
+            return list(xs), list(ys)
+        return affine_fn
+
+    gcps, gcp_crs = src.gcps
+    if gcps:
+        from rasterio.transform import GCPTransformer
+
+        def gcp_fn(cols, rows):
+            with GCPTransformer(gcps) as tf:
+                xs, ys = tf.xy(list(rows), list(cols), offset="ul")
+            xs, ys = np.atleast_1d(xs), np.atleast_1d(ys)
+            if gcp_crs is not None and not gcp_crs.is_geographic:
+                from rasterio.warp import transform as warp_transform
+                xs, ys = warp_transform(gcp_crs, "EPSG:4326", list(xs), list(ys))
+            return [float(x) for x in xs], [float(y) for y in ys]
+        return gcp_fn
+
+    return None
 
 
 # ── Band Definitions ───────────────────────────────────────────────────────────
@@ -90,16 +147,23 @@ class Preprocessor:
 
         log.info("Processing %s product: %s", sensor, product_dir.name)
 
+        if product_dir.is_file():
+            return self.process_geotiff(product_dir, sensor=sensor)
+
         if sensor == "S1":
-            image_array, transform, crs = self._read_sar(product_dir)
+            image_array, geo_fn = self._read_sar(product_dir)
         else:
-            image_array, transform, crs = self._read_optical(product_dir)
+            image_array, geo_fn = self._read_optical(product_dir)
 
         if image_array is None:
             log.error("Could not read image data from %s", product_dir)
             return []
+        if geo_fn is None:
+            log.warning("%s has no georeferencing — detections will have no "
+                        "lat/lon.", product_dir.name)
 
-        tiles = self._tile_image(image_array, transform, product_dir.name)
+        tiles = self._tile_image(image_array, None, product_dir.name,
+                                 geo_fn=geo_fn, skip_empty=True)
         log.info("Generated %d tiles from %s", len(tiles), product_dir.name)
         return tiles
 
@@ -108,102 +172,91 @@ class Preprocessor:
         if not HAS_RASTERIO:
             raise ImportError("rasterio required for GeoTIFF processing")
 
+        tif_path = Path(tif_path)
         with rasterio.open(tif_path) as src:
-            if sensor == "S1":
-                arr = self._sar_to_uint8(src.read(1))
+            if sensor == "S1" or src.count < 3:
+                arr = self._sar_to_uint8(src.read(1).astype(np.float32))
                 arr = np.stack([arr, arr, arr], axis=-1)
             else:
-                r = self._normalize_band(src.read(1))
-                g = self._normalize_band(src.read(2))
-                b = self._normalize_band(src.read(3))
+                r = self._normalize_band(src.read(1).astype(np.float32))
+                g = self._normalize_band(src.read(2).astype(np.float32))
+                b = self._normalize_band(src.read(3).astype(np.float32))
                 arr = np.stack([r, g, b], axis=-1)
-            transform = src.transform
+            geo_fn = make_geo_fn(src)
 
-        return self._tile_image(arr, transform, tif_path.stem)
+        return self._tile_image(arr, None, tif_path.stem, geo_fn=geo_fn,
+                                skip_empty=True)
 
     # ── Sentinel-1 SAR Reader ─────────────────────────────────────────────────
 
     def _read_sar(
         self, product_dir: Path
-    ) -> Tuple[Optional[np.ndarray], Optional[object], Optional[object]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[GeoFn]]:
         """
-        Read Sentinel-1 GRD VV+VH bands, apply dB→linear conversion,
-        and produce an RGB-like array (VV, VH, VV/VH ratio).
+        Read a Sentinel-1 GRD product and log-stretch it to an 8-bit greyscale
+        image (replicated to 3 channels).
+
+        The cross-polarised VH band is used when present — the sea surface is
+        much darker in VH, so ships stand out better — otherwise VV. Tiles are
+        deliberately single-band greyscale: that is what the SAR-Ship training
+        chips look like, and a detector fine-tuned on them finds almost
+        nothing in a false-colour VV/VH composite.
         """
         if not HAS_RASTERIO:
             log.error("rasterio not installed — cannot read SAR data.")
-            return None, None, None
+            return None, None
 
-        # Locate measurement TIFFs inside the .SAFE directory
-        meas_dir = product_dir / "measurement"
-        if not meas_dir.exists():
-            # Try GRD folder structure
-            candidates = list(product_dir.rglob("*vv*.tiff")) + \
-                         list(product_dir.rglob("*vv*.tif"))
-            if not candidates:
-                log.error("No VV band TIFF found in %s", product_dir)
-                return None, None, None
-            vv_path = candidates[0]
-        else:
-            vv_paths = list(meas_dir.glob("*vv*"))
-            vh_paths = list(meas_dir.glob("*vh*"))
-            vv_path  = vv_paths[0] if vv_paths else None
-            vh_path  = vh_paths[0] if vh_paths else None
+        def find(pol: str) -> Optional[Path]:
+            # Locate measurement TIFFs inside the .SAFE directory
+            meas_dir = product_dir / "measurement"
+            root = meas_dir if meas_dir.exists() else product_dir
+            for pattern in (f"*-{pol}-*.tif*", f"*-{pol}.tif*", f"*{pol}*.tif*"):
+                hits = sorted(root.rglob(pattern))
+                if hits:
+                    return hits[0]
+            return None
 
-        channels = []
-        transform, crs = None, None
+        path, name = find("vh"), "VH"
+        if path is None:
+            path, name = find("vv"), "VV"
+        if path is None:
+            log.error("No VV/VH band TIFF found in %s", product_dir)
+            return None, None
 
-        for path, name in [(vv_path, "VV"), (getattr(locals(), "vh_path", None), "VH")]:
-            if path and Path(path).exists():
-                with rasterio.open(path) as src:
-                    raw = src.read(1).astype(np.float32)
-                    transform = src.transform
-                    crs = src.crs
-                    linear = np.power(10.0, raw / 10.0)   # dB → linear power
-                    uint8  = self._sar_to_uint8(linear)
-                    channels.append(uint8)
-                    log.info("Read %s band: %s (%d×%d)", name, path.name,
-                             uint8.shape[0], uint8.shape[1])
+        with rasterio.open(path) as src:
+            # GRD measurements are digital-number amplitudes, not dB
+            raw = src.read(1).astype(np.float32)
+            geo_fn = make_geo_fn(src)
+        gray = self._sar_to_uint8(raw)
+        del raw
+        log.info("Read %s band: %s (%d×%d)", name, path.name,
+                 gray.shape[0], gray.shape[1])
 
-        if len(channels) == 0:
-            return None, None, None
-
-        if len(channels) == 1:
-            channels = channels * 3   # replicate single polarisation
-
-        if len(channels) == 2:
-            # Third channel: VV/VH ratio (useful for distinguishing ship from sea)
-            ratio = np.clip(
-                channels[0].astype(np.float32) / (channels[1].astype(np.float32) + 1e-6),
-                0, 255
-            ).astype(np.uint8)
-            channels.append(ratio)
-
-        return np.stack(channels, axis=-1), transform, crs
+        return np.stack([gray, gray, gray], axis=-1), geo_fn
 
     # ── Sentinel-2 Optical Reader ──────────────────────────────────────────────
 
     def _read_optical(
         self, product_dir: Path
-    ) -> Tuple[Optional[np.ndarray], Optional[object], Optional[object]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[GeoFn]]:
         """
         Read Sentinel-2 L2A RGB bands (10m resolution) and apply SCL cloud mask.
         Returns H×W×3 uint8 array.
         """
         if not HAS_RASTERIO:
             log.error("rasterio not installed — cannot read optical data.")
-            return None, None, None
+            return None, None
 
-        granule_dirs = list((product_dir / "GRANULE").glob("*"))
+        granule_dirs = [d for d in (product_dir / "GRANULE").glob("*") if d.is_dir()]
         if not granule_dirs:
             log.error("No GRANULE subdir found in %s", product_dir)
-            return None, None, None
+            return None, None
 
         granule = granule_dirs[0]
         r10_dir = granule / "IMG_DATA" / "R10m"
 
         channels = []
-        transform, crs = None, None
+        geo_fn = None
 
         for band_name in S2_RGB_BANDS:
             band_files = list(r10_dir.glob(f"*_{band_name}_10m.jp2"))
@@ -214,14 +267,13 @@ class Preprocessor:
                 continue
             with rasterio.open(band_files[0]) as src:
                 arr = src.read(1).astype(np.float32)
-                if transform is None:
-                    transform = src.transform
-                    crs = src.crs
+                if geo_fn is None:
+                    geo_fn = make_geo_fn(src)
                 channels.append(self._normalize_band(arr))
 
         if len(channels) != 3:
             log.error("Could not read all 3 RGB bands. Got %d.", len(channels))
-            return None, None, None
+            return None, None
 
         rgb = np.stack(channels, axis=-1)
 
@@ -230,7 +282,7 @@ class Preprocessor:
         if scl_files:
             rgb = self._apply_cloud_mask(rgb, scl_files[0], target_shape=rgb.shape[:2])
 
-        return rgb, transform, crs
+        return rgb, geo_fn
 
     # ── Tiling ─────────────────────────────────────────────────────────────────
 
@@ -239,55 +291,86 @@ class Preprocessor:
         image: np.ndarray,
         transform: Optional[object],
         product_name: str,
+        geo_fn: Optional[GeoFn] = None,
+        skip_empty: bool = False,
     ) -> List[Path]:
         """
         Slice a large H×W×3 array into TILE_SIZE×TILE_SIZE patches with overlap.
-        Each tile is saved as PNG. A sidecar JSON stores geographic coordinates.
+        Each tile is saved as PNG. A sidecar JSON stores the lat/lon of all
+        four tile corners and the ground sample distance.
+
+        Args:
+            transform:  Affine transform whose units are already lon/lat
+                        degrees (ignored when geo_fn is given).
+            geo_fn:     Pixel → lon/lat function from make_geo_fn().
+            skip_empty: Drop tiles that contain no data at all (scene borders).
         """
         if not HAS_PIL:
             log.error("Pillow not installed — cannot save tiles.")
             return []
 
+        if geo_fn is None and transform is not None:
+            def geo_fn(cols, rows, _t=transform):
+                pts = [_t * (c, r) for c, r in zip(cols, rows)]
+                return [p[0] for p in pts], [p[1] for p in pts]
+
+        ts = self.tile_size
         H, W, C = image.shape
+
+        # Pad scenes smaller than one tile so they still produce output
+        if H < ts or W < ts:
+            padded = np.zeros((max(H, ts), max(W, ts), C), dtype=image.dtype)
+            padded[:H, :W] = image
+            image = padded
+            H, W = image.shape[:2]
+
         tile_dir = self.out_dir / product_name
         tile_dir.mkdir(parents=True, exist_ok=True)
         paths: List[Path] = []
 
-        row_starts = list(range(0, H - self.tile_size + 1, self.stride))
-        col_starts = list(range(0, W - self.tile_size + 1, self.stride))
+        row_starts = list(range(0, H - ts + 1, self.stride))
+        col_starts = list(range(0, W - ts + 1, self.stride))
 
         # Ensure we always include the last row/col
-        if H > self.tile_size and row_starts[-1] + self.tile_size < H:
-            row_starts.append(H - self.tile_size)
-        if W > self.tile_size and col_starts[-1] + self.tile_size < W:
-            col_starts.append(W - self.tile_size)
+        if row_starts[-1] + ts < H:
+            row_starts.append(H - ts)
+        if col_starts[-1] + ts < W:
+            col_starts.append(W - ts)
 
+        n_skipped = 0
         for r in row_starts:
             for c in col_starts:
-                patch = image[r:r + self.tile_size, c:c + self.tile_size]
+                patch = image[r:r + ts, c:c + ts]
+                if skip_empty and not patch.any():
+                    n_skipped += 1
+                    continue
+
                 tile_name = f"tile_{r:05d}_{c:05d}"
                 png_path  = tile_dir / f"{tile_name}.png"
 
-                img = Image.fromarray(patch.astype(np.uint8), mode="RGB")
+                img = Image.fromarray(np.ascontiguousarray(patch, dtype=np.uint8))
                 img.save(png_path)
 
                 # Geo-metadata sidecar
-                meta: Dict = {"row": r, "col": c, "product": product_name}
-                if transform is not None:
-                    # Top-left corner pixel → geographic coordinate
-                    lon, lat = transform * (c, r)
-                    meta["lat_tl"] = round(float(lat), 6)
-                    meta["lon_tl"] = round(float(lon), 6)
-                    # Bottom-right corner
-                    lon2, lat2 = transform * (c + self.tile_size, r + self.tile_size)
-                    meta["lat_br"] = round(float(lat2), 6)
-                    meta["lon_br"] = round(float(lon2), 6)
+                meta: Dict = {"row": r, "col": c, "product": product_name,
+                              "tile_size": ts}
+                if geo_fn is not None:
+                    # Corner pixels → geographic coordinates (TL, TR, BL, BR)
+                    lons, lats = geo_fn([c, c + ts, c, c + ts],
+                                        [r, r, r + ts, r + ts])
+                    for key, lon, lat in zip(("tl", "tr", "bl", "br"), lons, lats):
+                        meta[f"lat_{key}"] = round(float(lat), 6)
+                        meta[f"lon_{key}"] = round(float(lon), 6)
+                    width_km = haversine_km((lats[0], lons[0]), (lats[1], lons[1]))
+                    meta["gsd_m"] = round(width_km * 1000.0 / ts, 3)
 
                 with open(png_path.with_suffix(".json"), "w") as f:
                     json.dump(meta, f)
 
                 paths.append(png_path)
 
+        if n_skipped:
+            log.info("Skipped %d empty (no-data) tile(s).", n_skipped)
         return paths
 
     # ── Helpers ────────────────────────────────────────────────────────────────
@@ -296,16 +379,25 @@ class Preprocessor:
     def _normalize_band(arr: np.ndarray, low_pct: float = 2.0,
                         high_pct: float = 98.0) -> np.ndarray:
         """Stretch percentile range to 0–255 uint8."""
-        lo = np.percentile(arr, low_pct)
-        hi = np.percentile(arr, high_pct)
+        lo, hi = np.percentile(_subsample(arr), [low_pct, high_pct])
         arr = np.clip((arr - lo) / (hi - lo + 1e-6), 0, 1)
         return (arr * 255).astype(np.uint8)
 
     @staticmethod
     def _sar_to_uint8(arr: np.ndarray) -> np.ndarray:
-        """Logarithmic stretch of SAR linear power values to uint8."""
-        arr = np.log1p(arr)
-        lo, hi = np.percentile(arr[arr > 0], [1, 99]) if np.any(arr > 0) else (0, 1)
+        """Logarithmic stretch of SAR amplitude / power values to uint8."""
+        arr = np.log1p(np.maximum(arr, 0))
+        sample = _subsample(arr)
+        valid = sample[sample > 0]
+        if valid.size:
+            lo, med, p999 = np.percentile(valid, [1, 50, 99.9])
+            # Ships are a tiny, very bright fraction of the scene. Stretching
+            # only to a high percentile would spend the whole 8-bit range on
+            # sea speckle and saturate ships together with its brightest
+            # pixels, so keep ~26 dB of headroom above the median.
+            hi = max(p999, med + 3.0)
+        else:
+            lo, hi = 0, 1
         arr = np.clip((arr - lo) / (hi - lo + 1e-6), 0, 1)
         return (arr * 255).astype(np.uint8)
 
