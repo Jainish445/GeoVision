@@ -1,3 +1,17 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.venv/
 *.pt
+*.pt.corrupt
+
+# Generated at runtime
+data/raw/
+data/tiles/
+data/processed/
+data/dataset/
+results/runs/
+results/*.geojson
+data/classifier/
+data/classifier_raw/
+results/*.png

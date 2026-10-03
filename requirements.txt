@@ -24,7 +24,7 @@ torchvision>=0.16
 ultralytics>=8.1       # YOLOv8
 
 # ── Tracking ───────────────────────────────────────────────────────────────────
-deep-sort-realtime>=1.3.2
+# Geographic track association uses scipy (listed above) — no extra package.
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 streamlit>=1.33

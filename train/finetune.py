@@ -8,14 +8,17 @@ Supported datasets (any YOLO-format dataset with 'ship' class):
   • Custom Roboflow export (YOLO format)
 
 Usage:
+    # Split the raw SAR-Ship dataset into train/val:
+    python train/finetune.py prepare --raw-dir data/SAR-Ship-Dataset --output-dir data/dataset
+
     # Basic fine-tuning:
-    python train/finetune.py --data data.yaml --epochs 80
+    python train/finetune.py train --data data/dataset/data.yaml --epochs 80
 
     # Resume from checkpoint:
-    python train/finetune.py --data data.yaml --resume runs/detect/exp/weights/last.pt
+    python train/finetune.py train --data data/dataset/data.yaml --resume results/runs/warship_detection/weights/last.pt
 
     # Export to ONNX after training:
-    python train/finetune.py --data data.yaml --export onnx
+    python train/finetune.py export --export onnx
 """
 
 import sys
@@ -26,11 +29,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     TRAIN_EPOCHS, TRAIN_BATCH_SIZE, TRAIN_LR0, TRAIN_LRF,
     TRAIN_IMG_SIZE, TRAIN_PATIENCE, TRAIN_WORKERS, TRAIN_DEVICE,
-    YOLO_MODEL_SIZE, MODELS_DIR, RESULTS_DIR,
+    YOLO_BASE_WEIGHTS, YOLO_WEIGHTS, MODELS_DIR, RESULTS_DIR,
 )
 from utils.logger import get_logger
 
 log = get_logger("finetune")
+
+
+def resolve_device(device: str) -> str:
+    """Map "auto" to GPU 0 when CUDA is available, and never request a
+    GPU that isn't there (ultralytics raises on an invalid device)."""
+    try:
+        import torch
+        has_cuda = torch.cuda.is_available()
+    except ImportError:
+        has_cuda = False
+
+    if device == "auto":
+        return "0" if has_cuda else "cpu"
+    if device != "cpu" and device != "mps" and not has_cuda:
+        log.warning("CUDA device '%s' requested but not available — using CPU.",
+                    device)
+        return "cpu"
+    return device
 
 
 def build_data_yaml(
@@ -70,25 +91,31 @@ def train(args: argparse.Namespace):
         log.info("Resuming from checkpoint: %s", args.resume)
         model = YOLO(args.resume)
     else:
-        weights = f"{YOLO_MODEL_SIZE}.pt"
+        if args.resume:
+            log.warning("Checkpoint %s not found — starting from pretrained.",
+                        args.resume)
+        # Absolute path: downloaded here if missing, independent of the cwd
+        weights = str(YOLO_BASE_WEIGHTS)
         log.info("Fine-tuning from pretrained: %s", weights)
         model = YOLO(weights)
 
+    device = resolve_device(args.device)
+
     # Hyperparameter overrides (Ultralytics supports keyword args)
     train_kwargs = {
-        "data":      args.data,
+        "data":      str(Path(args.data).resolve()),
         "epochs":    args.epochs,
-        "imgsz":     TRAIN_IMG_SIZE,
+        "imgsz":     args.imgsz,
         "batch":     args.batch,
+        "fraction":  args.fraction,
         "lr0":       TRAIN_LR0,
         "lrf":       TRAIN_LRF,
         "patience":  TRAIN_PATIENCE,
-        "workers":   TRAIN_WORKERS,
-        "device":    args.device,
+        "workers":   args.workers,
+        "device":    device,
         "project":   str(RESULTS_DIR / "runs"),
         "name":      "warship_detection",
         "exist_ok":  True,
-        "augment":   True,
         "save":      True,
         "plots":     True,
         "val":       True,
@@ -115,7 +142,7 @@ def train(args: argparse.Namespace):
     # Save best weights to our models dir
     best_weights = Path(results.save_dir) / "weights" / "best.pt"
     if best_weights.exists():
-        dest = MODELS_DIR / "warship_yolov8m.pt"
+        dest = YOLO_WEIGHTS
         import shutil
         shutil.copy2(best_weights, dest)
         log.info("Best weights copied to %s", dest)
@@ -127,13 +154,14 @@ def evaluate(args: argparse.Namespace):
     """Run validation metrics on the best saved model."""
     from ultralytics import YOLO
 
-    weights = args.weights or str(MODELS_DIR / "warship_yolov8m.pt")
+    weights = args.weights or str(YOLO_WEIGHTS)
     if not Path(weights).exists():
         log.error("Weights not found: %s", weights)
         sys.exit(1)
 
     model = YOLO(weights)
-    metrics = model.val(data=args.data, imgsz=TRAIN_IMG_SIZE, device=args.device)
+    metrics = model.val(data=str(Path(args.data).resolve()), imgsz=args.imgsz,
+                        device=resolve_device(args.device))
 
     print("\n=== Validation Metrics ===")
     print(f"  mAP@50:     {metrics.box.map50:.4f}")
@@ -147,86 +175,37 @@ def export_model(args: argparse.Namespace):
     """Export the trained model to ONNX / TensorRT / CoreML etc."""
     from ultralytics import YOLO
 
-    weights = args.weights or str(MODELS_DIR / "warship_yolov8m.pt")
+    weights = args.weights or str(YOLO_WEIGHTS)
+    if not Path(weights).exists():
+        log.error("Weights not found: %s", weights)
+        sys.exit(1)
     model   = YOLO(weights)
-    path    = model.export(format=args.export, imgsz=TRAIN_IMG_SIZE)
+    path    = model.export(format=args.export, imgsz=TRAIN_IMG_SIZE,
+                           device=resolve_device(args.device))
     log.info("Model exported to %s", path)
 
 
-def prepare_sar_ship_dataset(raw_dir: Path, output_dir: Path):
+def prepare_sar_ship_dataset(raw_dir: Path, output_dir: Path, seed: int = 42):
     """
-    Convert SAR-Ship dataset (HRSC-like format) to YOLO annotation format.
-    
-    SAR-Ship structure:
-        raw_dir/
-          images/    *.png
-          labels/    *.xml  (PASCAL VOC format)
-    
+    Split the SAR-Ship dataset into YOLO train/val folders.
+
+    Accepts either layout:
+      • YOLO labels  — *.jpg / *.png with a same-named *.txt (the layout of
+                       https://github.com/CAESAR-Radi/SAR-Ship-Dataset), either
+                       flat in raw_dir or under images/ + labels/.
+      • PASCAL VOC   — images under JPEGImages/ (or images/) with *.xml under
+                       Annotations/ (or labels/).
+
     Output structure (YOLO format):
         output_dir/
-          images/train/  *.png
-          images/val/    *.png
-          labels/train/  *.txt
-          labels/val/    *.txt
+          images/train/  images/val/
+          labels/train/  labels/val/
+          data.yaml
     """
-    import random
-    import xml.etree.ElementTree as ET
+    from data.dataset import DatasetManager
 
     log.info("Preparing SAR-Ship dataset: %s → %s", raw_dir, output_dir)
-
-    img_dir = raw_dir / "images"
-    lbl_dir = raw_dir / "labels"
-
-    images = sorted(img_dir.glob("*.png"))
-    random.shuffle(images)
-
-    split = int(0.8 * len(images))
-    splits = {"train": images[:split], "val": images[split:]}
-
-    for split_name, split_images in splits.items():
-        out_img = output_dir / "images" / split_name
-        out_lbl = output_dir / "labels" / split_name
-        out_img.mkdir(parents=True, exist_ok=True)
-        out_lbl.mkdir(parents=True, exist_ok=True)
-
-        for img_path in split_images:
-            xml_path = lbl_dir / img_path.with_suffix(".xml").name
-            if not xml_path.exists():
-                continue
-
-            # Parse PASCAL VOC XML
-            tree = ET.parse(xml_path)
-            root = tree.getroot()
-            size  = root.find("size")
-            W = int(size.find("width").text)
-            H = int(size.find("height").text)
-
-            yolo_lines = []
-            for obj in root.findall("object"):
-                bnd = obj.find("bndbox")
-                x1 = float(bnd.find("xmin").text)
-                y1 = float(bnd.find("ymin").text)
-                x2 = float(bnd.find("xmax").text)
-                y2 = float(bnd.find("ymax").text)
-
-                cx = (x1 + x2) / (2 * W)
-                cy = (y1 + y2) / (2 * H)
-                bw = (x2 - x1) / W
-                bh = (y2 - y1) / H
-                yolo_lines.append(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-
-            import shutil
-            shutil.copy2(img_path, out_img / img_path.name)
-            (out_lbl / img_path.with_suffix(".txt").name).write_text(
-                "\n".join(yolo_lines)
-            )
-
-    # Write data.yaml
-    build_data_yaml(
-        train_dir = output_dir / "images" / "train",
-        val_dir   = output_dir / "images" / "val",
-        output    = output_dir / "data.yaml",
-    )
+    DatasetManager(output_dir).prepare_sar_ship(raw_dir, output_dir, seed=seed)
     log.info("Dataset preparation complete.")
 
 
@@ -243,12 +222,20 @@ if __name__ == "__main__":
     p_train.add_argument("--batch",   type=int, default=TRAIN_BATCH_SIZE)
     p_train.add_argument("--device",  default=TRAIN_DEVICE)
     p_train.add_argument("--resume",  help="Resume from .pt checkpoint")
+    p_train.add_argument("--imgsz",   type=int, default=TRAIN_IMG_SIZE,
+                         help="Training image size. SAR-Ship chips are 256 px at "
+                              "Sentinel-1 resolution, so 256 keeps ships at the "
+                              "scale they have in pipeline tiles (and is ~6× faster)")
+    p_train.add_argument("--fraction", type=float, default=1.0,
+                         help="Fraction of the training set to use (e.g. 0.2 on CPU)")
+    p_train.add_argument("--workers", type=int, default=TRAIN_WORKERS)
 
     # eval
     p_eval = sub.add_parser("eval", help="Evaluate saved model")
     p_eval.add_argument("--data",    required=True)
     p_eval.add_argument("--weights", default=None)
     p_eval.add_argument("--device",  default=TRAIN_DEVICE)
+    p_eval.add_argument("--imgsz",   type=int, default=TRAIN_IMG_SIZE)
 
     # export
     p_exp = sub.add_parser("export", help="Export model")

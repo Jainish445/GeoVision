@@ -19,16 +19,38 @@ Usage:
 import sys
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional
-from datetime import datetime
+from typing import Iterable, Iterator, List, Optional
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import DB_PATH
+from config import DB_PATH, UNIDENTIFIED_LABEL
 from models.detector import Detection
 from utils.logger import get_logger
 
 log = get_logger("geodb")
+
+
+def utc_now_iso() -> str:
+    """Current UTC time as ISO-8601 with a 'Z' suffix (sorts lexicographically)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_ts(ts: Optional[str]) -> Optional[str]:
+    """
+    Normalise any ISO-8601 timestamp to 'YYYY-MM-DDTHH:MM:SSZ' (UTC) so that
+    string comparison in SQL matches chronological order.
+    """
+    if not ts:
+        return ts
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ── Schema ─────────────────────────────────────────────────────────────────────
@@ -62,6 +84,10 @@ CREATE TABLE IF NOT EXISTS detections (
     class_name    TEXT,
     warship_type  TEXT,
     warship_conf  REAL,
+    length_m      REAL,
+    beam_m        REAL,
+    size_class    TEXT,           -- warship type with a hull this size
+    type_source   TEXT,           -- evidence behind warship_type
     vessel_name   TEXT,
     vessel_mmsi   TEXT,
     vessel_flag   TEXT,
@@ -110,21 +136,34 @@ class GeoDB:
 
     # ── Connection helper ──────────────────────────────────────────────────────
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection, commit on success, and always close it."""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_schema(self):
         with self._connect() as conn:
             conn.execute(CREATE_ACQUISITIONS)
             conn.execute(CREATE_DETECTIONS)
             conn.execute(CREATE_TRACKS)
+            # Migrate databases created before these columns existed
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(detections)")}
+            for col, kind in (("length_m", "REAL"), ("beam_m", "REAL"),
+                              ("size_class", "TEXT"), ("type_source", "TEXT")):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE detections ADD COLUMN {col} {kind}")
             for idx_sql in CREATE_INDEXES:
                 conn.execute(idx_sql)
-            conn.commit()
 
     # ── Acquisitions ───────────────────────────────────────────────────────────
 
@@ -142,10 +181,10 @@ class GeoDB:
             (id, region, sensor, product_name, acquisition_ts, ingestion_ts, n_tiles)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        now = datetime.utcnow().isoformat()
+        now = utc_now_iso()
         with self._connect() as conn:
-            conn.execute(sql, (acq_id, region, sensor, product_name, acq_ts, now, n_tiles))
-            conn.commit()
+            conn.execute(sql, (acq_id, region, sensor, product_name,
+                               normalize_ts(acq_ts), now, n_tiles))
 
     def update_acquisition_count(self, acq_id: str, n_detections: int):
         with self._connect() as conn:
@@ -153,7 +192,6 @@ class GeoDB:
                 "UPDATE acquisitions SET n_detections=? WHERE id=?",
                 (n_detections, acq_id),
             )
-            conn.commit()
 
     # ── Detections ─────────────────────────────────────────────────────────────
 
@@ -175,9 +213,10 @@ class GeoDB:
             (acquisition_id, track_id, tile_path, lat, lon,
              bbox_x1, bbox_y1, bbox_x2, bbox_y2,
              confidence, class_name, warship_type, warship_conf,
+             length_m, beam_m, size_class, type_source,
              vessel_name, vessel_mmsi, vessel_flag, timestamp, region)
         VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         rows = []
         for d in detections:
@@ -193,16 +232,19 @@ class GeoDB:
                 d.class_name,
                 d.warship_type,
                 d.warship_conf,
+                d.length_m,
+                d.beam_m,
+                d.size_class,
+                d.type_source,
                 d.vessel_name,
                 d.vessel_mmsi,
                 d.vessel_flag,
-                d.timestamp,
+                normalize_ts(d.timestamp),
                 region,
             ))
 
         with self._connect() as conn:
             conn.executemany(sql, rows)
-            conn.commit()
 
         self.update_acquisition_count(acquisition_id, len(rows))
         log.info("Inserted %d detection(s) for acquisition '%s'.", len(rows), acquisition_id)
@@ -227,7 +269,7 @@ class GeoDB:
             params.append(track_id)
         if since:
             clauses.append("timestamp >= ?")
-            params.append(since)
+            params.append(normalize_ts(since))
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql   = f"SELECT * FROM detections {where} ORDER BY timestamp DESC LIMIT ?"
@@ -284,8 +326,8 @@ class GeoDB:
             conn.execute(sql, (
                 track_id,
                 region,
-                first.timestamp or "",
-                newest.timestamp or "",
+                normalize_ts(first.timestamp) or "",
+                normalize_ts(newest.timestamp) or "",
                 len(detections),
                 dominant_type,
                 newest.vessel_name,
@@ -293,7 +335,72 @@ class GeoDB:
                 newest.vessel_flag,
                 json.dumps(trail),
             ))
-            conn.commit()
+
+    def rebuild_tracks(self, track_ids: Iterable[int]) -> None:
+        """
+        Recompute track rows from the detections table: first/last seen,
+        cumulative detection count, dominant warship type, latest AIS identity
+        and the full chronological trail.
+        """
+        with self._connect() as conn:
+            for tid in set(t for t in track_ids if t is not None):
+                rows = conn.execute(
+                    "SELECT * FROM detections WHERE track_id = ? "
+                    "ORDER BY timestamp, id", (tid,)
+                ).fetchall()
+                if not rows:
+                    conn.execute("DELETE FROM tracks WHERE track_id = ?", (tid,))
+                    continue
+
+                types = [r["warship_type"] for r in rows if r["warship_type"]]
+                # Prefer a specific type over the catch-all labels when both occur
+                specific = [t for t in types
+                            if t not in ("Unknown Warship", UNIDENTIFIED_LABEL)] or types
+                dominant = max(set(specific), key=specific.count) if specific else None
+
+                def latest(col):
+                    return next((r[col] for r in reversed(rows) if r[col]), None)
+
+                trail = [
+                    {"lat": r["lat"], "lon": r["lon"],
+                     "timestamp": r["timestamp"] or "",
+                     "confidence": r["confidence"]}
+                    for r in rows if r["lat"] is not None and r["lon"] is not None
+                ]
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO tracks
+                        (track_id, region, first_seen, last_seen, n_detections,
+                         warship_type, vessel_name, vessel_mmsi, vessel_flag,
+                         trail_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (tid, rows[-1]["region"], rows[0]["timestamp"] or "",
+                     rows[-1]["timestamp"] or "", len(rows), dominant,
+                     latest("vessel_name"), latest("vessel_mmsi"),
+                     latest("vessel_flag"), json.dumps(trail)),
+                )
+
+    def next_track_id(self) -> int:
+        """Next unused track ID (IDs are global across regions and runs)."""
+        with self._connect() as conn:
+            a = conn.execute("SELECT MAX(track_id) FROM tracks").fetchone()[0] or 0
+            b = conn.execute("SELECT MAX(track_id) FROM detections").fetchone()[0] or 0
+        return max(a, b) + 1
+
+    def clear_demo(self) -> int:
+        """Remove all synthetic demo rows (sensor='DEMO'). Returns rows deleted."""
+        with self._connect() as conn:
+            demo = "SELECT id FROM acquisitions WHERE sensor = 'DEMO'"
+            tids = [r[0] for r in conn.execute(
+                f"SELECT DISTINCT track_id FROM detections "
+                f"WHERE acquisition_id IN ({demo})")]
+            n = conn.execute(
+                f"DELETE FROM detections WHERE acquisition_id IN ({demo})"
+            ).rowcount
+            conn.execute("DELETE FROM acquisitions WHERE sensor = 'DEMO'")
+        self.rebuild_tracks(tids)
+        return n
 
     def query_tracks(
         self,
@@ -307,7 +414,7 @@ class GeoDB:
             params.append(region)
         if active_since:
             clauses.append("last_seen >= ?")
-            params.append(active_since)
+            params.append(normalize_ts(active_since))
 
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         sql   = f"SELECT * FROM tracks {where} ORDER BY last_seen DESC"
@@ -350,7 +457,7 @@ class GeoDB:
         detections = self.query_detections(region=region, limit=100_000)
         features = []
         for d in detections:
-            if d.get("lat") and d.get("lon"):
+            if d.get("lat") is not None and d.get("lon") is not None:
                 features.append({
                     "type": "Feature",
                     "geometry": {

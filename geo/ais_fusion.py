@@ -24,7 +24,7 @@ import math
 import csv
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     import requests
@@ -33,7 +33,10 @@ except ImportError:
     HAS_REQUESTS = False
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import MARINETRAFFIC_API_KEY, AISHUB_USER
+from config import (
+    MARINETRAFFIC_API_KEY, AISHUB_USER, CIVILIAN_LABEL, UNIDENTIFIED_LABEL,
+    CROWD_RADIUS_KM, CROWD_MIN_NEIGHBOURS, CROWD_CONFIDENCE,
+)
 from models.detector import Detection
 from utils.logger import get_logger
 
@@ -47,6 +50,21 @@ MILITARY_AIS_TYPES = {
     58,   # Medical transport
 }
 
+# AIS type codes that positively identify a non-military vessel
+CIVILIAN_AIS_TYPES = (
+    {30, 31, 32, 36, 37, 52}          # fishing, towing, sailing, pleasure, tug
+    | set(range(60, 90))              # passenger, cargo, tanker
+)
+
+
+def _num(value, cast=float, default=0):
+    """Tolerant numeric conversion — CSV exports contain blanks and 'N/A'."""
+    try:
+        return cast(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 # Search radius around each detection (km)
 DEFAULT_SEARCH_RADIUS_KM = 2.0
 
@@ -59,22 +77,26 @@ class AISRecord:
         self.mmsi       = str(data.get("MMSI", ""))
         self.name       = str(data.get("SHIPNAME", data.get("name", "UNKNOWN"))).strip()
         self.flag       = str(data.get("FLAG", data.get("flag", "")))
-        self.ship_type  = int(data.get("SHIPTYPE", data.get("type", 0)))
-        self.lat        = float(data.get("LAT", data.get("lat", 0.0)))
-        self.lon        = float(data.get("LON", data.get("lon", 0.0)))
-        self.speed      = float(data.get("SPEED", data.get("sog", 0.0)))
-        self.heading    = float(data.get("HEADING", data.get("cog", 0.0)))
+        self.ship_type  = _num(data.get("SHIPTYPE", data.get("type", 0)), int)
+        self.lat        = _num(data.get("LAT", data.get("lat")), default=None)
+        self.lon        = _num(data.get("LON", data.get("lon")), default=None)
+        self.speed      = _num(data.get("SPEED", data.get("sog", 0.0)))
+        self.heading    = _num(data.get("HEADING", data.get("cog", 0.0)))
         self.timestamp  = str(data.get("TIMESTAMP", ""))
-        self.length     = float(data.get("LENGTH", 0.0))
-        self.width      = float(data.get("WIDTH", 0.0))
+        self.length     = _num(data.get("LENGTH", 0.0))
+        self.width      = _num(data.get("WIDTH", 0.0))
 
     @property
     def is_military(self) -> bool:
         return self.ship_type in MILITARY_AIS_TYPES
 
+    @property
+    def is_civilian(self) -> bool:
+        return self.ship_type in CIVILIAN_AIS_TYPES
+
     def __repr__(self):
         return (f"AISRecord(mmsi={self.mmsi}, name={self.name!r}, "
-                f"flag={self.flag}, lat={self.lat:.4f}, lon={self.lon:.4f})")
+                f"flag={self.flag}, lat={self.lat}, lon={self.lon})")
 
 
 # ── AIS Fusion ─────────────────────────────────────────────────────────────────
@@ -102,6 +124,7 @@ class AISFusion:
         self.cache_ttl         = timedelta(minutes=cache_ttl_minutes)
         self._cache:     List[AISRecord] = []
         self._cache_time: Optional[datetime] = None
+        self._cache_bbox: Optional[tuple] = None
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -121,6 +144,8 @@ class AISFusion:
 
         Returns:
             Same list with vessel_name, vessel_mmsi, vessel_flag populated.
+            Detections matched to a commercial vessel (cargo, tanker,
+            passenger, fishing …) are relabelled CIVILIAN_LABEL.
         """
         # Compute bbox from detections if not provided
         if bbox is None:
@@ -143,7 +168,22 @@ class AISFusion:
             if match:
                 d.vessel_name = match.name if match.name != "UNKNOWN" else None
                 d.vessel_mmsi = match.mmsi
-                d.vessel_flag = match.flag
+                d.vessel_flag = match.flag or None
+                if match.is_civilian:
+                    d.warship_type = CIVILIAN_LABEL
+                    d.warship_conf = None
+                    d.type_source  = "ais"
+                elif match.is_military and d.warship_type in (None, UNIDENTIFIED_LABEL):
+                    # AIS says it is a military vessel; the measured hull says
+                    # which kind. Together that supports a warship type.
+                    if d.size_class:
+                        d.warship_type = d.size_class
+                        d.warship_conf = d.size_conf
+                        d.type_source  = "ais+size"
+                    else:
+                        d.warship_type = "Unknown Warship"
+                        d.warship_conf = None
+                        d.type_source  = "ais"
                 log.debug(
                     "Detection at (%.4f, %.4f) matched → %s (%s)",
                     d.lat, d.lon, match.name, match.flag,
@@ -161,9 +201,9 @@ class AISFusion:
 
     def _fetch_vessels(self, bbox: tuple) -> List[AISRecord]:
         """Route to the appropriate backend, with caching."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         if (self._cache_time and (now - self._cache_time) < self.cache_ttl
-                and self._cache):
+                and self._cache and self._cache_bbox in (None, bbox)):
             log.debug("Using cached AIS data (%d records).", len(self._cache))
             return self._cache
 
@@ -179,6 +219,7 @@ class AISFusion:
 
         self._cache      = records
         self._cache_time = now
+        self._cache_bbox = bbox
         return records
 
     def _fetch_marinetraffic(self, bbox: tuple) -> List[AISRecord]:
@@ -267,13 +308,13 @@ class AISFusion:
         records: List[AISRecord] = []
 
         if path.suffix == ".json":
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 records = [AISRecord(v) for v in data]
 
         elif path.suffix == ".csv":
-            with open(path, newline="") as f:
+            with open(path, newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     try:
@@ -297,12 +338,59 @@ class AISFusion:
         best_vessel = None
 
         for v in vessels:
+            if v.lat is None or v.lon is None:
+                continue
             dist = _haversine_km(lat, lon, v.lat, v.lon)
             if dist < best_dist:
                 best_dist   = dist
                 best_vessel = v
 
         return best_vessel
+
+
+# ── Context: crowded commercial waters ────────────────────────────────────────
+
+def label_crowded_waters(
+    detections: List[Detection],
+    radius_km: float = CROWD_RADIUS_KM,
+    min_neighbours: int = CROWD_MIN_NEIGHBOURS,
+    confidence: float = CROWD_CONFIDENCE,
+) -> List[Detection]:
+    """
+    Mark still-unidentified ships that sit in a crowd of other ships as
+    probable civilian vessels.
+
+    Dozens of ships within a few kilometres of each other is what commercial
+    anchorages, port approaches and shipping lanes look like; warships in
+    company keep kilometres apart. This is an inference from context, not an
+    identification — it is recorded as type_source="context" with a modest
+    confidence, and anything AIS or the CNN has already labelled is untouched.
+    """
+    if min_neighbours <= 0:
+        return detections
+
+    located = [d for d in detections if d.lat is not None and d.lon is not None]
+    n_marked = 0
+    for d in located:
+        if d.warship_type not in (None, UNIDENTIFIED_LABEL):
+            continue
+        # Cheap latitude pre-filter before the haversine
+        max_dlat = radius_km / 110.0
+        neighbours = sum(
+            1 for o in located
+            if o is not d and abs(o.lat - d.lat) <= max_dlat
+            and _haversine_km(d.lat, d.lon, o.lat, o.lon) <= radius_km
+        )
+        if neighbours >= min_neighbours:
+            d.warship_type = CIVILIAN_LABEL
+            d.warship_conf = confidence
+            d.type_source  = "context"
+            n_marked += 1
+
+    if n_marked:
+        log.info("Context: %d unidentified ship(s) in crowded waters marked "
+                 "probable civilian.", n_marked)
+    return detections
 
 
 # ── Haversine ──────────────────────────────────────────────────────────────────
