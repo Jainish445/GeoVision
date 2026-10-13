@@ -276,7 +276,10 @@ def build_map(df: pd.DataFrame, tracks: List[dict], show_trails: bool) -> "foliu
 
     # Zoom to the data instead of the whole world
     if not df.empty:
-        pad = 0.5
+        # Margin proportional to the data: a naval base spans 3 km, a sea 1000
+        span = max(df["lat"].max() - df["lat"].min(),
+                   df["lon"].max() - df["lon"].min())
+        pad = min(0.5, max(0.005, 0.15 * span))
         m.fit_bounds([[df["lat"].min() - pad, df["lon"].min() - pad],
                       [df["lat"].max() + pad, df["lon"].max() + pad]])
 
@@ -297,9 +300,16 @@ def render_sidebar():
         help="Filter map and table to a specific maritime region.",
     )
 
-    days = st.sidebar.slider("Show last N days", 1, 30, 7)
+    # Sentinel passes reach the archive days late and revisit every 6–12 days,
+    # so a one-week default hides most real data
+    days = st.sidebar.slider("Show last N days", 1, 90, 30)
     since = (datetime.datetime.now(datetime.timezone.utc)
              - datetime.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Aerial imagery (NAIP) is years old, far outside any "last N days" window
+    if st.sidebar.toggle("All dates", value=False,
+                         help="Ignore the day filter — needed for aerial imagery, "
+                              "which is flown every 2–3 years."):
+        since = None
 
     show_trails = st.sidebar.toggle("Show Track Trails", value=True)
 

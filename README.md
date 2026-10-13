@@ -5,6 +5,11 @@ major surface warships in near-real-time using Sentinel-1 SAR and Sentinel-2 opt
 imagery, YOLOv8 detection, geographic multi-acquisition tracking, warship type
 classification, and AIS data fusion.
 
+> **New here?** [docs/REPRODUCE.md](docs/REPRODUCE.md) is a step-by-step guide
+> from a fresh clone to every result: the demo, training the detector and the
+> classifier, real Sentinel-1 scans, and identifying warships by type at
+> Naval Station Norfolk. No accounts or GPU needed.
+
 ---
 
 ## 📂 Project Structure
@@ -125,6 +130,31 @@ python pipeline.py --region Persian_Gulf --sensor S2 --days 5
 # lat_min lon_min lat_max lon_max — e.g. the Singapore Strait
 python pipeline.py --bbox 1.05 103.60 1.35 104.10 --local-region Singapore_Strait --days 30
 ```
+
+### Sharp imagery — real warship types, no AIS
+
+```bash
+# Naval Station Norfolk, 0.6 m aerial imagery (NAIP), newest flight
+python pipeline.py --sensor NAIP --bbox 36.936 -76.345 36.966 -76.318     --local-region Norfolk_Naval_Station --no-ais
+```
+
+`--sensor NAIP` switches the pipeline to high-resolution mode:
+
+| Stage | Sentinel-1 mode | High-resolution mode |
+|---|---|---|
+| Imagery | 10 m radar, worldwide, every few days | 0.6 m aerial photos (resampled to 1.2 m), **United States only**, re-flown every 2–3 years |
+| Detector | YOLOv8 fine-tuned on SAR-Ship | YOLOv8-OBB trained on aerial photos (DOTA), run at three zoom levels |
+| Hull size | segmented from the radar return | read off the oriented box |
+| Type | none without AIS (size class only) | **CNN**, 88.9 % on held-out test images |
+
+On the Norfolk scene (9 Oct 2023) it finds and correctly types all four
+aircraft carriers, plus destroyers and a cruiser at the right hull lengths.
+Known weak spots: small craft and tugs get arbitrary labels, auxiliaries fall
+under "Unknown Warship", and ships moored hard against each other can be boxed
+together. NAIP is free via Planetary Computer and needs no account; the
+imagery is years old, so tick **All dates** in the dashboard to see it. The
+same mode works on any RGB GeoTIFF of similar resolution via
+`--local-dir image.tif --sensor NAIP`.
 
 ### All regions (full world scan)
 

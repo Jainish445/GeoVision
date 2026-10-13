@@ -374,6 +374,8 @@ def label_crowded_waters(
     for d in located:
         if d.warship_type not in (None, UNIDENTIFIED_LABEL):
             continue
+        if d.type_source == "cnn":
+            continue        # the CNN saw the ship and could not decide — leave it
         # Cheap latitude pre-filter before the haversine
         max_dlat = radius_km / 110.0
         neighbours = sum(

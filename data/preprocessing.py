@@ -40,7 +40,7 @@ except ImportError:
     print("[WARNING] Pillow not found — install it with: pip install Pillow")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import TILE_SIZE_PX, TILE_STRIDE, TILES_DIR
+from config import TILE_SIZE_PX, TILE_STRIDE, TILES_DIR, HR_SCALES
 from utils.geo_utils import haversine_km
 from utils.logger import get_logger
 
@@ -147,6 +147,9 @@ class Preprocessor:
 
         log.info("Processing %s product: %s", sensor, product_dir.name)
 
+        if sensor == "NAIP":
+            return self.process_highres(product_dir)
+
         if product_dir.is_file():
             return self.process_geotiff(product_dir, sensor=sensor)
 
@@ -186,6 +189,56 @@ class Preprocessor:
 
         return self._tile_image(arr, None, tif_path.stem, geo_fn=geo_fn,
                                 skip_empty=True)
+
+    def process_highres(self, product: Path, scales=HR_SCALES) -> List[Path]:
+        """
+        Tile a high-resolution RGB GeoTIFF (e.g. NAIP aerial imagery).
+
+        Pixel values are used as they are (no contrast stretch). Besides the
+        native-resolution tiles, a coarser set is produced for every extra
+        entry in `scales`: the largest hulls (aircraft carriers) fill a
+        native tile and are found more reliably when they appear smaller.
+        Each tile's sidecar records its own ground sample distance.
+        """
+        if not (HAS_RASTERIO and HAS_PIL):
+            raise ImportError("rasterio and Pillow required for GeoTIFF processing")
+
+        product = Path(product)
+        if product.is_dir():
+            tifs = sorted(product.rglob("*.tif")) + sorted(product.rglob("*.tiff"))
+            if not tifs:
+                log.error("No GeoTIFF found in %s", product)
+                return []
+            tif_path = tifs[0]
+        else:
+            tif_path = product
+
+        with rasterio.open(tif_path) as src:
+            if src.count < 3:
+                log.error("%s is not an RGB image.", tif_path.name)
+                return []
+            image = np.transpose(src.read([1, 2, 3]), (1, 2, 0)).astype(np.uint8)
+            geo_fn = make_geo_fn(src)
+
+        name = product.name if product.is_dir() else product.stem
+        tiles: List[Path] = []
+        for scale in scales:
+            if scale == 1:
+                tiles += self._tile_image(image, None, name, geo_fn=geo_fn,
+                                          skip_empty=True)
+                continue
+            h, w = image.shape[0] // scale, image.shape[1] // scale
+            small = np.asarray(Image.fromarray(image).resize((w, h), Image.BOX))
+
+            def scaled_geo(cols, rows, _s=scale):
+                return geo_fn([c * _s for c in cols], [r * _s for r in rows])
+
+            tiles += self._tile_image(small, None, f"{name}_x{scale}",
+                                      geo_fn=scaled_geo if geo_fn else None,
+                                      skip_empty=True)
+        log.info("Generated %d tiles from %s (scales %s)", len(tiles), name,
+                 list(scales))
+        return tiles
 
     # ── Sentinel-1 SAR Reader ─────────────────────────────────────────────────
 

@@ -68,6 +68,20 @@ DETECT_CLASSES      = ["ship"]
 # in practice they are islets, breakwaters or piers.
 DETECT_MAX_SHIP_M   = 500.0
 
+# ─── High-resolution optical mode (sensor "NAIP") ─────────────────────────────
+# Sharp aerial imagery (USDA NAIP, 0.6 m, United States only, free via
+# Planetary Computer). At this resolution hull detail is visible, so ships are
+# found with an oriented-box detector trained on aerial photos (DOTA) and
+# typed by the CNN — no AIS needed.
+HR_GSD_M        = 1.2            # imagery is resampled to this (metres/pixel)
+HR_TILE_SIZE_PX = 1024
+HR_TILE_STRIDE  = 512            # 50 % overlap: any ship up to ~600 m fits a tile
+HR_SCALES       = (1, 2, 3)      # also detect at 2× and 3× coarser: aircraft
+                                 # carriers are only found reliably when small
+HR_CONF_THRESHOLD = 0.25
+HR_MIN_SHIP_M   = 30.0           # smaller craft (tugs, boats) are ignored
+OBB_WEIGHTS     = MODELS_DIR / "yolov8l-obb.pt"   # official DOTA weights, auto-downloaded
+
 # ─── Warship Classifier ───────────────────────────────────────────────────────
 CLASSIFIER_WEIGHTS  = MODELS_DIR / "warship_classifier.pt"
 WARSHIP_CLASSES     = [

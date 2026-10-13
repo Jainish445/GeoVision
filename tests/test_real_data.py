@@ -140,6 +140,22 @@ class TestPlanetaryComputer:
         assert p["ContentDate"]["Start"] == "2024-01-15T06:00:12Z"
         assert p["aoi"] == (12.0, 32.0, 30.0, 43.5)
 
+    def test_date_pins_the_search_to_one_day(self, tmp_path):
+        """--date must turn into a one-day search window."""
+        from tests.test_components import _make_pipeline
+        pipe = _make_pipeline(tmp_path, enable_classifier=False)
+        seen = {}
+
+        class FakeIngester:
+            def query_bbox(self, bbox, days_back=7, sensor="S1", **kw):
+                seen.update(kw)
+                return []
+
+        pipe.ingester = FakeIngester()
+        pipe.run_region("X", bbox=(1.0, 103.0, 1.3, 104.0), date="2026-09-27")
+        assert seen == {"date_start": "2026-09-27T00:00:00Z",
+                        "date_end": "2026-09-28T00:00:00Z"}
+
     def test_sentinel2_not_supported(self):
         from data.ingestion import PlanetaryComputerIngester
         with pytest.raises(ValueError, match="Sentinel-1 only"):
