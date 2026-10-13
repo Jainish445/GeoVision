@@ -375,7 +375,8 @@ class WarshipClassifier:
         r = self._classify(np.asarray(crop.convert("RGB")), gsd_m)
         return r["type"], r["conf"]
 
-    def _classify(self, crop_arr: np.ndarray, gsd_m: float) -> dict:
+    def _classify(self, crop_arr: np.ndarray, gsd_m: float,
+                  dims: Optional[Tuple[float, float]] = None) -> dict:
         """
         Classify one crop. Returns a dict with:
             type, conf      — the label the evidence supports
@@ -386,7 +387,9 @@ class WarshipClassifier:
         """
         self._load_model()
 
-        dims = measure_ship(crop_arr, gsd_m)
+        # Dimensions from an oriented-box detector beat segmenting the crop
+        if dims is None:
+            dims = measure_ship(crop_arr, gsd_m)
         length_m, beam_m = dims if dims else (None, None)
 
         size_class, size_conf = None, None
@@ -519,7 +522,8 @@ class WarshipClassifier:
             return
 
         crop = np.ascontiguousarray(image[y1p:y2p, x1p:x2p], dtype=np.uint8)
-        r = self._classify(crop, gsd_m)
+        known = (d.length_m, d.beam_m) if d.length_m and d.beam_m else None
+        r = self._classify(crop, gsd_m, dims=known)
         d.warship_type = r["type"]
         d.warship_conf = round(r["conf"], 4) if r["conf"] is not None else None
         d.type_source  = r["source"]

@@ -42,9 +42,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import (
     REGIONS_OF_INTEREST, RESULTS_DIR, DATA_SOURCE,
     CIVILIAN_LABEL, UNIDENTIFIED_LABEL,
+    HR_TILE_SIZE_PX, HR_TILE_STRIDE, HR_CONF_THRESHOLD, HR_MIN_SHIP_M, OBB_WEIGHTS,
     YOLO_CONF_THRESHOLD, YOLO_IMGSZ,
 )
-from data.ingestion     import make_ingester
+from data.ingestion     import make_ingester, PlanetaryComputerIngester
 from data.preprocessing import Preprocessor
 from models.detector    import ShipDetector, Detection
 from models.tracker     import ShipTracker
@@ -87,6 +88,14 @@ class WarshipPipeline:
         self.detector   = ShipDetector(conf=conf_threshold, device=device)
         self.tracker    = ShipTracker()
         self.db         = GeoDB()
+
+        # High-resolution optical mode (sensor "NAIP"): bigger tiles and an
+        # oriented-box detector trained on aerial photos
+        self.preprocessor_hr = Preprocessor(tile_size=HR_TILE_SIZE_PX,
+                                            stride=HR_TILE_STRIDE)
+        self.detector_hr = ShipDetector(weights=OBB_WEIGHTS, conf=HR_CONF_THRESHOLD,
+                                        imgsz=HR_TILE_SIZE_PX, device=device,
+                                        keep_classes={"ship"})
 
         if enable_classifier:
             self.classifier = WarshipClassifier(device=device)
@@ -133,6 +142,7 @@ class WarshipPipeline:
         days_back:   int = 7,
         max_products: int = 1,
         bbox:        Optional[tuple] = None,
+        date:        Optional[str] = None,
     ) -> List[Detection]:
         """
         Download the latest satellite data for a region and run the full pipeline.
@@ -142,6 +152,8 @@ class WarshipPipeline:
                           is given.
             bbox:         Optional (lat_min, lon_min, lat_max, lon_max) to
                           search instead of a named region.
+            date:         Optional YYYY-MM-DD: use the imagery acquired on that
+                          UTC day instead of the newest (reproducible runs).
 
         Returns:
             List of Detection objects with all fields populated.
@@ -152,22 +164,46 @@ class WarshipPipeline:
 
         # 1. Download
         log.info("[1/7] Querying and downloading satellite imagery …")
+        # NAIP only exists on Planetary Computer
+        ingester = PlanetaryComputerIngester() if sensor == "NAIP" else self.ingester
+        window = {}
+        if date:
+            day = datetime.strptime(date, "%Y-%m-%d")
+            window = {
+                "date_start": day.strftime("%Y-%m-%dT00:00:00Z"),
+                "date_end": (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"),
+            }
         if bbox is not None:
-            products = self.ingester.query_bbox(tuple(bbox), days_back=days_back,
-                                                sensor=sensor)
+            products = ingester.query_bbox(tuple(bbox), days_back=days_back,
+                                           sensor=sensor, **window)
         else:
-            products = self.ingester.query_region(region_name, days_back=days_back,
-                                                  sensor=sensor)
+            products = ingester.query_region(region_name, days_back=days_back,
+                                             sensor=sensor, **window)
         if not products:
             log.warning("No products found for region '%s'. Skipping.", region_name)
             return []
 
+        if sensor == "NAIP":
+            max_products = len(products)     # one flight, several image quads
         products = products[:max_products]
-        product_paths = self.ingester.download(products, max_items=max_products)
+        product_paths = ingester.download(products, max_items=max_products)
+        products = products[:len(product_paths)] if sensor != "NAIP" else products
         if not product_paths:
             return []
 
         all_detections: List[Detection] = []
+
+        if sensor == "NAIP":
+            # One flight split over adjoining, slightly overlapping image
+            # quads: treat them as a single acquisition so that ships on a
+            # seam are not counted twice.
+            return self._process_product(
+                product_path=product_paths[0],
+                region=region_name,
+                sensor=sensor,
+                acq_ts=_extract_timestamp(products[0]),
+                extra_paths=product_paths[1:],
+            )
 
         # Oldest first so tracks are extended in chronological order
         pairs = sorted(zip(products, product_paths),
@@ -214,14 +250,23 @@ class WarshipPipeline:
         region:       str,
         sensor:       str,
         acq_ts:       str,
+        extra_paths:  tuple = (),
     ) -> List[Detection]:
-        """Stages 2–9 for a single satellite product."""
+        """
+        Stages 2–9 for a single satellite product. `extra_paths` are further
+        pieces of the same acquisition, tiled and detected together with it.
+        """
         product_name = product_path.name
         acq_id = f"{region}_{product_name[:20]}_{uuid.uuid4().hex[:6]}"
 
         # 2. Preprocess → tiles
         log.info("[2/7] Preprocessing → tiles …")
-        tile_paths = self.preprocessor.process_product(product_path, sensor=sensor)
+        hr = sensor == "NAIP"
+        preprocessor = self.preprocessor_hr if hr else self.preprocessor
+        detector     = self.detector_hr if hr else self.detector
+        tile_paths = preprocessor.process_product(product_path, sensor=sensor)
+        for extra in extra_paths:
+            tile_paths += preprocessor.process_product(extra, sensor=sensor)
         log.info("  %d tile(s) generated.", len(tile_paths))
 
         if not tile_paths:
@@ -238,7 +283,7 @@ class WarshipPipeline:
 
         # 3. Detection
         log.info("[3/7] Running YOLOv8 ship detection …")
-        detections = self.detector.run_batch(tile_paths)
+        detections = detector.run_batch(tile_paths, batch_size=2 if hr else 8)
 
         # Set timestamp on every detection
         for d in detections:
@@ -247,7 +292,8 @@ class WarshipPipeline:
         # 4. NMS across tile overlaps
         log.info("[4/7] Applying cross-tile NMS …")
         detections = ShipDetector.nms_across_tiles(detections)
-        detections = ShipDetector.filter_by_size(detections)
+        detections = ShipDetector.filter_by_size(
+            detections, min_length_m=HR_MIN_SHIP_M if hr else 0.0)
         log.info("  %d detection(s) after NMS.", len(detections))
 
         if not detections:
@@ -521,8 +567,10 @@ def parse_args():
     group.add_argument("--demo", action="store_true",
                        help="Run with synthetic demo data (no download)")
 
-    parser.add_argument("--sensor",  default="S1", choices=["S1", "S2"],
-                        help="Satellite sensor (default: S1 SAR)")
+    parser.add_argument("--sensor",  default="S1", choices=["S1", "S2", "NAIP"],
+                        help="S1 = Sentinel-1 radar (default), S2 = Sentinel-2 "
+                             "optical,\nNAIP = 0.6 m aerial imagery (US only) — sharp "
+                             "enough for the CNN to type warships")
     parser.add_argument("--days",    type=int, default=7,
                         help="Days of history to search (default: 7)")
     parser.add_argument("--device",  default="cpu",
@@ -539,6 +587,9 @@ def parse_args():
                         choices=["auto", "copernicus", "planetary"],
                         help="Imagery source (default: auto — Copernicus if "
                              "credentials are set, else Planetary Computer)")
+    parser.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                        help="Use the imagery acquired on this UTC day instead of "
+                             "the newest (makes a run reproducible)")
     parser.add_argument("--max-products", type=int, default=1,
                         help="Products to process per region, newest first")
     parser.add_argument("--no-geojson", dest="export_geojson", action="store_false",
@@ -584,6 +635,7 @@ def main():
                     days_back    = args.days,
                     max_products = args.max_products,
                     bbox         = args.bbox,
+                    date         = args.date,
                 ))
             except Exception as e:
                 log.error("Region '%s' failed: %s", region, e)

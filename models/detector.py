@@ -29,6 +29,9 @@ from config import (
     YOLO_WEIGHTS, YOLO_BASE_WEIGHTS, YOLO_CONF_THRESHOLD, YOLO_IOU_THRESHOLD,
     YOLO_IMGSZ, TILE_SIZE_PX, DETECT_MAX_SHIP_M,
 )
+
+# COCO has no "ship"; "boat" is the closest proxy when no fine-tuned weights exist
+COCO_FALLBACK_CLASSES = {"boat"}
 from utils.logger import get_logger
 
 log = get_logger("detector")
@@ -48,6 +51,9 @@ class Detection:
     # Geographic position (centre of bbox, from sidecar JSON)
     lat:         Optional[float] = None
     lon:         Optional[float] = None
+
+    # Hull outline as four (lat, lon) corners — set by oriented-box detectors
+    footprint:   Optional[list] = None
 
     # Set by tracker
     track_id:    Optional[int] = None
@@ -119,12 +125,20 @@ class ShipDetector:
         iou:  float = YOLO_IOU_THRESHOLD,
         imgsz: int  = YOLO_IMGSZ,
         device: str = "cpu",
+        keep_classes: Optional[set] = None,
     ):
+        """
+        Args:
+            keep_classes: Class names to keep (e.g. {"ship"} for a general
+                          aerial-imagery model). None keeps every class, which
+                          is right for weights fine-tuned on ships only.
+        """
         self.weights  = weights or YOLO_WEIGHTS
         self.conf     = conf
         self.iou      = iou
         self.imgsz    = imgsz
         self.device   = device
+        self.keep_classes = keep_classes
         self._model   = None
         self._custom_model = False
 
@@ -140,8 +154,10 @@ class ShipDetector:
                 "ultralytics not installed. Run: pip install ultralytics"
             )
 
-        if self.weights.exists():
-            log.info("Loading fine-tuned weights: %s", self.weights)
+        if self.weights.exists() or self.weights != YOLO_WEIGHTS:
+            # Explicitly requested weights that are missing are official
+            # ultralytics releases, which YOLO() downloads to this path.
+            log.info("Loading weights: %s", self.weights)
             self._model = YOLO(str(self.weights))
             self._custom_model = True
         else:
@@ -161,6 +177,7 @@ class ShipDetector:
                     "delete it and re-run so it is downloaded again."
                 ) from e
             self._custom_model = False
+            self.keep_classes = COCO_FALLBACK_CLASSES
 
         log.info("Model loaded on device: %s", self.device)
 
@@ -168,57 +185,11 @@ class ShipDetector:
 
     def detect_tile(self, tile_path: Path) -> List[Detection]:
         """Run detection on a single tile PNG."""
-        self._load_model()
-
-        results = self._model.predict(
-            source=str(tile_path),
-            conf=self.conf,
-            iou=self.iou,
-            imgsz=self.imgsz,
-            device=self.device,
-            verbose=False,
-        )
-
-        detections: List[Detection] = []
-        geo = self._load_geo(tile_path)
-
-        for r in results:
-            if r.boxes is None:
-                continue
-            for box in r.boxes:
-                cls_id = int(box.cls.item())
-
-                # If using COCO model, only keep boat class
-                if not self._custom_model and cls_id != self.COCO_BOAT_CLASS:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf.item())
-                cls_name = (
-                    self._model.names[cls_id]
-                    if hasattr(self._model, "names")
-                    else "ship"
-                )
-
-                lat, lon = self._pixel_to_geo(
-                    cx=(x1 + x2) / 2, cy=(y1 + y2) / 2, geo=geo
-                )
-
-                detections.append(Detection(
-                    tile_path=tile_path,
-                    bbox_px=(x1, y1, x2, y2),
-                    confidence=conf,
-                    class_id=cls_id,
-                    class_name=cls_name,
-                    lat=lat,
-                    lon=lon,
-                ))
-
-        return detections
+        return self.run_batch([tile_path], batch_size=1, quiet=True)
 
     def run_tiles(self, tile_paths: List[Path], verbose: bool = True) -> List[Detection]:
         """
-        Run detection on a list of tile paths.
+        Run detection on a list of tile paths, one at a time.
 
         Returns:
             Merged list of Detection objects from all tiles.
@@ -229,9 +200,7 @@ class ShipDetector:
         for i, tp in enumerate(tile_paths):
             if verbose:
                 print(f"\r  Detecting … tile {i+1}/{total}", end="", flush=True)
-
-            dets = self.detect_tile(tp)
-            all_detections.extend(dets)
+            all_detections.extend(self.detect_tile(tp))
 
         if verbose:
             print()
@@ -244,10 +213,12 @@ class ShipDetector:
 
     # ── Batch Inference (faster via ultralytics batch API) ────────────────────
 
-    def run_batch(self, tile_paths: List[Path], batch_size: int = 8) -> List[Detection]:
+    def run_batch(self, tile_paths: List[Path], batch_size: int = 8,
+                  quiet: bool = False) -> List[Detection]:
         """
         Batch inference — up to ~3× faster than tile-by-tile on GPU.
         Groups tiles into batches and calls YOLO once per batch.
+        Handles both axis-aligned and oriented-box (OBB) models.
         """
         self._load_model()
         all_detections: List[Detection] = []
@@ -257,7 +228,8 @@ class ShipDetector:
         ]
 
         for b_idx, batch in enumerate(batches):
-            log.info("Batch %d/%d (%d tiles) …", b_idx + 1, len(batches), len(batch))
+            if not quiet:
+                log.info("Batch %d/%d (%d tiles) …", b_idx + 1, len(batches), len(batch))
             results = self._model.predict(
                 source=[str(p) for p in batch],
                 conf=self.conf,
@@ -267,29 +239,69 @@ class ShipDetector:
                 verbose=False,
             )
             for tile_path, r in zip(batch, results):
-                geo = self._load_geo(tile_path)
-                if r.boxes is None:
-                    continue
-                for box in r.boxes:
-                    cls_id = int(box.cls.item())
-                    if not self._custom_model and cls_id != self.COCO_BOAT_CLASS:
-                        continue
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    lat, lon = self._pixel_to_geo(
-                        cx=(x1 + x2) / 2, cy=(y1 + y2) / 2, geo=geo
-                    )
-                    all_detections.append(Detection(
-                        tile_path=tile_path,
-                        bbox_px=(x1, y1, x2, y2),
-                        confidence=float(box.conf.item()),
-                        class_id=cls_id,
-                        class_name=self._model.names.get(cls_id, "ship"),
-                        lat=lat,
-                        lon=lon,
-                    ))
+                all_detections.extend(self._parse_result(Path(tile_path), r))
 
-        log.info("Batch detection complete — %d detection(s).", len(all_detections))
+        if not quiet:
+            log.info("Batch detection complete — %d detection(s).", len(all_detections))
         return all_detections
+
+    def _parse_result(self, tile_path: Path, r) -> List[Detection]:
+        """Turn one ultralytics result into Detection objects."""
+        geo = self._load_geo(tile_path)
+        names = self._model.names
+        out: List[Detection] = []
+
+        def keep(cls_id: int) -> bool:
+            return self.keep_classes is None or names.get(cls_id) in self.keep_classes
+
+        if getattr(r, "obb", None) is not None:
+            # Oriented boxes: the hull outline and its true length / beam
+            gsd_m = (geo or {}).get("gsd_m")
+            for corners, xyxy, xywhr, conf, cls in zip(
+                r.obb.xyxyxyxy.tolist(), r.obb.xyxy.tolist(), r.obb.xywhr.tolist(),
+                r.obb.conf.tolist(), r.obb.cls.tolist(),
+            ):
+                cls_id = int(cls)
+                if not keep(cls_id):
+                    continue
+                lat, lon = self._pixel_to_geo(xywhr[0], xywhr[1], geo)
+                footprint = [self._pixel_to_geo(x, y, geo) for x, y in corners]
+                d = Detection(
+                    tile_path=tile_path,
+                    bbox_px=tuple(xyxy),
+                    confidence=float(conf),
+                    class_id=cls_id,
+                    class_name=names.get(cls_id, "ship"),
+                    lat=lat,
+                    lon=lon,
+                    footprint=footprint if lat is not None else None,
+                )
+                if gsd_m:
+                    d.length_m = round(max(xywhr[2], xywhr[3]) * gsd_m, 1)
+                    d.beam_m   = round(min(xywhr[2], xywhr[3]) * gsd_m, 1)
+                out.append(d)
+            return out
+
+        if r.boxes is None:
+            return out
+        for box in r.boxes:
+            cls_id = int(box.cls.item())
+            if not keep(cls_id):
+                continue
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            lat, lon = self._pixel_to_geo(
+                cx=(x1 + x2) / 2, cy=(y1 + y2) / 2, geo=geo
+            )
+            out.append(Detection(
+                tile_path=tile_path,
+                bbox_px=(x1, y1, x2, y2),
+                confidence=float(box.conf.item()),
+                class_id=cls_id,
+                class_name=names.get(cls_id, "ship"),
+                lat=lat,
+                lon=lon,
+            ))
+        return out
 
     # ── Geo helpers ────────────────────────────────────────────────────────────
 
@@ -339,10 +351,12 @@ class ShipDetector:
     def filter_by_size(
         detections: List[Detection],
         max_length_m: float = DETECT_MAX_SHIP_M,
+        min_length_m: float = 0.0,
     ) -> List[Detection]:
         """
-        Drop detections whose box is longer than any ship. On real coastal
-        scenes these are islets, breakwaters and piers.
+        Drop detections whose box is longer than any ship (on real coastal
+        scenes these are islets, breakwaters and piers) or shorter than
+        min_length_m (boats, when only ships are of interest).
         """
         geo_cache: dict = {}
         keep = []
@@ -352,11 +366,12 @@ class ShipDetector:
                 geo_cache[key] = ShipDetector._load_geo(Path(d.tile_path)) or {}
             gsd_m = geo_cache[key].get("gsd_m", 10.0)
             x1, y1, x2, y2 = d.bbox_px
-            if max(x2 - x1, y2 - y1) * gsd_m <= max_length_m:
+            length = d.length_m or max(x2 - x1, y2 - y1) * gsd_m
+            if min_length_m <= length <= max_length_m:
                 keep.append(d)
         if len(keep) < len(detections):
-            log.info("Dropped %d detection(s) larger than %.0f m (not ships).",
-                     len(detections) - len(keep), max_length_m)
+            log.info("Dropped %d detection(s) outside %.0f–%.0f m (not ships).",
+                     len(detections) - len(keep), min_length_m, max_length_m)
         return keep
 
     # ── NMS across tiles ───────────────────────────────────────────────────────
@@ -403,6 +418,10 @@ class ShipDetector:
         def duplicate(best: Detection, d: Detection) -> bool:
             if best.lat is None or d.lat is None:
                 return False
+            if best.footprint and d.footprint:
+                # Hull outlines known: duplicates overlap, neighbours moored
+                # side by side do not
+                return _footprint_overlap(best.footprint, d.footprint) > 0.5
             threshold = 0.05      # 50 m — two ships can't occupy the same spot
             if str(best.tile_path) != str(d.tile_path):
                 threshold = max(threshold, meta[id(best)][0], meta[id(d)][0])
@@ -416,6 +435,22 @@ class ShipDetector:
         log.debug("NMS: %d → %d detections after suppression.",
                   len(detections), len(keep))
         return keep
+
+
+def _footprint_overlap(a: list, b: list) -> float:
+    """Intersection area of two (lat, lon) outlines over the smaller one's area."""
+    from shapely.geometry import Polygon
+
+    lat0 = a[0][0]
+    kx = 111_320.0 * float(np.cos(np.radians(lat0)))     # metres per degree lon
+
+    def poly(corners):
+        return Polygon([((lon - a[0][1]) * kx, (lat - lat0) * 111_320.0)
+                        for lat, lon in corners]).buffer(0)
+
+    pa, pb = poly(a), poly(b)
+    smaller = min(pa.area, pb.area)
+    return pa.intersection(pb).area / smaller if smaller > 0 else 0.0
 
 
 def _geo_distance_km(lat1, lon1, lat2, lon2) -> float:

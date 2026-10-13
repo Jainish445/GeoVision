@@ -15,3 +15,4 @@ results/*.geojson
 data/classifier/
 data/classifier_raw/
 results/*.png
+results/*.jpg

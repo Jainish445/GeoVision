@@ -8,9 +8,11 @@ Two sources of the same Sentinel imagery are supported:
       – Sentinel-1 GRD (SAR, cloud-independent, best for open ocean)
       – Sentinel-2 L2A (optical, cloud-screened)
   • PlanetaryComputerIngester   — Microsoft Planetary Computer. No account
-                                  needed; fetches only the window of the
-                                  Sentinel-1 GRD scene that covers the area
-                                  of interest.
+                                  needed; fetches only the window that covers
+                                  the area of interest, from either
+      – Sentinel-1 GRD (sensor "S1"), or
+      – NAIP aerial imagery (sensor "NAIP": 0.6 m RGB, United States only,
+        each state re-flown every 2–3 years).
 
 make_ingester() picks one based on config.DATA_SOURCE.
 
@@ -35,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     COPERNICUS_USER, COPERNICUS_PASSWORD,
     CDSE_BASE_URL, CDSE_DOWNLOAD_URL,
-    DATA_SOURCE, PC_STAC_URL, PC_SIGN_URL, PC_MAX_WINDOW_PX,
+    DATA_SOURCE, PC_STAC_URL, PC_SIGN_URL, PC_MAX_WINDOW_PX, HR_GSD_M,
     DATA_DIR, REGIONS_OF_INTEREST,
     SAR_PRODUCT_TYPE, SAR_MAX_RESULTS,
     OPT_MAX_CLOUD_COVER, OPT_MAX_RESULTS,
@@ -180,12 +182,15 @@ class SentinelIngester:
         bbox: Tuple[float, float, float, float],
         days_back: int = 5,
         sensor: str = "S1",
+        date_start: Optional[str] = None,
+        date_end:   Optional[str] = None,
     ) -> List[Dict]:
         """Query using a raw (lat_min, lon_min, lat_max, lon_max) bounding box."""
         roi_key = "_custom_bbox_"
         REGIONS_OF_INTEREST[roi_key] = bbox
         try:
-            return self.query_region(roi_key, days_back=days_back, sensor=sensor)
+            return self.query_region(roi_key, days_back=days_back, sensor=sensor,
+                                     date_start=date_start, date_end=date_end)
         finally:
             del REGIONS_OF_INTEREST[roi_key]
 
@@ -307,6 +312,8 @@ class PlanetaryComputerIngester:
         date_end:   Optional[str] = None,
     ) -> List[Dict]:
         """Query using a (lat_min, lon_min, lat_max, lon_max) bounding box."""
+        if sensor == "NAIP":
+            return self._query_naip(tuple(bbox), day=(date_start or "")[:10] or None)
         if sensor != "S1":
             raise ValueError(
                 "The Planetary Computer source supports Sentinel-1 only. For "
@@ -372,6 +379,12 @@ class PlanetaryComputerIngester:
         downloaded: List[Path] = []
 
         for product in products[:max_items]:
+            if product.get("kind") == "naip":
+                path = self._download_naip(product, output_dir)
+                if path is not None:
+                    downloaded.append(path)
+                continue
+
             lat_min, lon_min, lat_max, lon_max = product["aoi"]
             tag = "%+08.3f%+08.3f" % ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2)
             dest_dir = output_dir / f"{product['Name']}_{tag}.SAFE"
@@ -428,6 +441,106 @@ class PlanetaryComputerIngester:
             log.warning("No products found for region '%s'.", region_name)
             return []
         return self.download(products, max_items=max_items)
+
+    # ── NAIP high-resolution aerial imagery ────────────────────────────────────
+
+    def _query_naip(self, bbox: Tuple[float, float, float, float],
+                    day: Optional[str] = None) -> List[Dict]:
+        """
+        NAIP imagery over a bbox. NAIP is flown state by state every 2–3
+        years, so there is no "last N days": the most recent flight is
+        returned (one product per image quad the bbox touches), or the flight
+        of `day` (YYYY-MM-DD) when given.
+        """
+        lat_min, lon_min, lat_max, lon_max = bbox
+        body = {
+            "collections": ["naip"],
+            "bbox": [lon_min, lat_min, lon_max, lat_max],
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}],
+            "limit": 50,
+        }
+        log.info("[NAIP] Querying Planetary Computer for bbox %s …", bbox)
+        resp = requests.post(PC_STAC_URL, json=body, timeout=60)
+        resp.raise_for_status()
+        features = [f for f in resp.json().get("features", [])
+                    if "image" in f.get("assets", {})]
+        if not features:
+            log.warning("No NAIP imagery here (NAIP covers the United States only).")
+            return []
+
+        if day:
+            features = [f for f in features
+                        if f["properties"]["datetime"][:10] == day]
+            if not features:
+                log.warning("No NAIP flight on %s over this area.", day)
+                return []
+        newest = features[0]["properties"]["datetime"][:4]
+        products = [{
+            "Id": f["id"],
+            "Name": f["id"],
+            "ContentDate": {"Start": f["properties"]["datetime"]},
+            "assets": {"image": f["assets"]["image"]["href"]},
+            "aoi": tuple(bbox),
+            "kind": "naip",
+        } for f in features if f["properties"]["datetime"][:4] == newest]
+        log.info("Found %d image(s) from the %s flight.", len(products), newest)
+        return products
+
+    def _download_naip(self, product: Dict, output_dir: Path) -> Optional[Path]:
+        """Fetch the AOI window of one NAIP image, resampled to HR_GSD_M."""
+        import rasterio
+        from affine import Affine
+        from rasterio.warp import transform_bounds
+        from rasterio.windows import Window, from_bounds, transform as window_transform
+
+        lat_min, lon_min, lat_max, lon_max = product["aoi"]
+        tag = "%+08.3f%+08.3f" % ((lat_min + lat_max) / 2, (lon_min + lon_max) / 2)
+        dest_dir = output_dir / f"{product['Name']}_{tag}.NAIP"
+        if (dest_dir / "image.tif").exists():
+            log.info("Already downloaded: %s — skipping.", dest_dir.name)
+            return dest_dir
+
+        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+                          GDAL_HTTP_MAX_RETRY="3"):
+            with rasterio.open(self._sign(product["assets"]["image"])) as src:
+                bounds = transform_bounds("EPSG:4326", src.crs,
+                                          lon_min, lat_min, lon_max, lat_max)
+                try:
+                    win = from_bounds(*bounds, transform=src.transform).intersection(
+                        Window(0, 0, src.width, src.height))
+                except rasterio.errors.WindowError:
+                    win = None
+                if win is None or win.width < 64 or win.height < 64:
+                    log.warning("%s does not cover the area of interest — skipped.",
+                                product["Name"])
+                    return None
+                win = win.round_offsets().round_lengths()
+
+                # Resample to the working resolution, capped in size (centre crop)
+                step = max(1, round(HR_GSD_M / abs(src.res[0])))
+                cap = self.max_window_px * step
+                if win.width > cap:
+                    win = Window(win.col_off + (win.width - cap) // 2, win.row_off,
+                                 cap, win.height)
+                if win.height > cap:
+                    win = Window(win.col_off, win.row_off + (win.height - cap) // 2,
+                                 win.width, cap)
+                out_h, out_w = int(win.height // step), int(win.width // step)
+                log.info("Downloading %s — %d×%d px at %.1f m …", product["Name"],
+                         out_w, out_h, abs(src.res[0]) * step)
+                data = src.read([1, 2, 3], window=win, out_shape=(3, out_h, out_w))
+                transform = window_transform(win, src.transform) * Affine.scale(
+                    win.width / out_w, win.height / out_h)
+                crs = src.crs
+
+        tmp_dir = output_dir / (dest_dir.name + ".part")
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(tmp_dir / "image.tif", "w", driver="GTiff",
+                           height=out_h, width=out_w, count=3, dtype=data.dtype,
+                           crs=crs, transform=transform, compress="deflate") as dst:
+            dst.write(data)
+        tmp_dir.replace(dest_dir)
+        return dest_dir
 
     # ── Internal ───────────────────────────────────────────────────────────────
 
